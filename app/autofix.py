@@ -199,9 +199,13 @@ def _split_positions(text: str, enders: str) -> list[int]:
         ch = text[i]
         if ch in "<{":
             in_tag = True
-        elif ch in ">}":
+            i += 1
+            continue
+        if ch in ">}":
             in_tag = False
-        elif not in_tag and ch in enders:
+            i += 1
+            continue
+        if not in_tag and ch in enders:
             if ch in _LATIN_NEED_SPACE and i + 1 < n and not text[i + 1].isspace():
                 i += 1
                 continue
@@ -210,7 +214,8 @@ def _split_positions(text: str, enders: str) -> list[int]:
                 j += 1
             while j < n and text[j] == " ":
                 j += 1
-            if j < n:
+            # 剩余内容仅为标签（如尾部 </i></v>）时不拆，标签归前一段
+            if j < n and strip_tags(text[j:]).strip():
                 pos.append(j)
             i = j
         else:
@@ -222,13 +227,51 @@ def _split_at(text: str, positions: list[int]) -> list[str]:
     out, last = [], 0
     for p in positions:
         seg = text[last:p].strip()
-        if seg:
+        if seg and strip_tags(seg).strip():  # 丢弃无可见内容的纯标签段
             out.append(seg)
         last = p
     tail = text[last:].strip()
-    if tail:
+    if tail and strip_tags(tail).strip():
         out.append(tail)
     return out
+
+
+_TAG_NAME_RE = re.compile(r"</?\s*([a-zA-Z][a-zA-Z0-9]*)")
+
+
+def _tag_name(tag: str) -> str | None:
+    m = _TAG_NAME_RE.match(tag)
+    return m.group(1).lower() if m else None
+
+
+def _balance_tags(pieces: list[str]) -> list[str]:
+    """拆分后保留说话人/样式标签并使各段标签闭合。
+
+    每段末尾补闭合未关闭的标签，下一段开头重新打开，
+    使各段都是格式良好的片段（如 ``<v 张三><i>…</i></v>``）。
+    """
+    result: list[str] = []
+    open_tags: list[str] = []
+    for idx, piece in enumerate(pieces):
+        if idx > 0 and open_tags:
+            piece = "".join(open_tags) + piece
+        # 从空栈扫描：段首补开的标签就在文本中，会被正常入栈
+        stack: list[str] = []
+        for m in re.finditer(r"<[^>]+>", piece):
+            tag = m.group(0)
+            if tag.startswith("</"):
+                name = _tag_name(tag)
+                for k in range(len(stack) - 1, -1, -1):
+                    if _tag_name(stack[k]) == name:
+                        del stack[k]
+                        break
+            elif not tag.endswith("/>"):
+                stack.append(tag)
+        if stack:
+            piece += "".join(f"</{_tag_name(t)}>" for t in reversed(stack))
+        result.append(piece)
+        open_tags = stack
+    return result
 
 
 _LABEL_RE = re.compile(r"^[-–—]?\s*\S{1,12}[：:]$")
@@ -279,6 +322,7 @@ def split_text(text: str, rules: Rules, depth: int = 0) -> list[str]:
         pieces = _split_at(text, _split_positions(text, _CLAUSE_ENDERS))
     if len(pieces) < 2:
         pieces = _hard_split(text)
+    pieces = _balance_tags(pieces)
     pieces = _merge_label(pieces)
     if depth >= 4:
         return pieces

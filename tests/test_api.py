@@ -293,3 +293,93 @@ def test_export_vtt_roundtrip_keeps_tags():
     # 也可以导出为 SRT（格式转换）
     r = client.get(f"/projects/{pid}/versions/{vid}/export", params={"format": "srt"})
     assert "-->" in r.text
+
+
+# ---------------------------------------------------------------- 标签字幕拆句（回归）
+
+VTT_TAGGED = """WEBVTT
+
+00:00:01.000 --> 00:00:03.000
+<v 张三><i>你好世界。这是一句带标签的长台词，必须拆开。</i></v>
+
+00:00:08.000 --> 00:00:10.000
+<v 李四>没问题。</v>
+"""
+
+
+def test_split_text_with_tags_terminates():
+    """回归：含说话人/样式标签的文本拆句不得卡死，且各段标签保留。"""
+    import threading
+
+    from app.autofix import split_text
+    from app.schemas import Rules as RulesModel
+
+    rules = RulesModel(max_cps=5.0, max_duration_ms=2000)
+    text = "<v 张三><i>你好世界。这是一句带标签的长台词，必须拆开。</i></v>"
+    result = {}
+
+    def run():
+        result["pieces"] = split_text(text, rules)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "拆句在含说话人/样式标签的文本上卡死"
+    pieces = result["pieces"]
+    assert len(pieces) >= 2
+    for p in pieces:
+        assert "<v 张三>" in p                    # 说话人标签每段保留
+        assert p.count("<i>") == p.count("</i>")  # 样式标签闭合
+        assert p.count("</v>") == 1
+
+
+def test_autofix_vtt_with_speaker_and_style_tags():
+    """含标签的 VTT 触发拆句后，接口正常返回，标签保留，原稿不变。"""
+    rules = {**RULES, "max_cps": 5.0, "max_duration_ms": 2000, "max_offset_ms": 4000}
+    pid = _make_project(rules=rules)
+    vid = _upload(pid, VTT_TAGGED)
+    r = client.post(f"/projects/{pid}/versions/{vid}/autofix")
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["conflicts"] == []
+    assert body["summary"]["cue_count_after"] > 2  # 第 1 条被拆分
+
+    fixed = client.get(f"/projects/{pid}/versions/{body['new_version_id']}").json()
+    # 由第 1 条拆出的各段都保留说话人与样式标签且标签闭合
+    for cue in fixed["cues"][:-1]:
+        text = "".join(cue["lines"])
+        assert "<v 张三>" in text
+        assert text.count("<i>") == text.count("</i>") == 1
+        assert text.count("</v>") == 1
+    # 第 2 条不受影响
+    assert fixed["cues"][-1]["lines"] == ["<v 李四>没问题。</v>"]
+
+    # 原稿未被覆盖
+    orig = client.get(f"/projects/{pid}/versions/{vid}").json()
+    assert orig["cues"][0]["lines"] == [
+        "<v 张三><i>你好世界。这是一句带标签的长台词，必须拆开。</i></v>"]
+    assert orig["cues"][0]["start_ms"] == 1000
+    assert orig["cues"][0]["end_ms"] == 3000
+
+    # 修复结果通过质检（无 error 级问题）
+    report = client.post(f"/projects/{pid}/versions/{body['new_version_id']}/qc").json()
+    assert [i for i in report["issues"] if i["severity"] == "error"] == []
+
+
+def test_autofix_vtt_tagged_conflict_keeps_original():
+    """含标签字幕无法消解冲突时返回冲突项，且新版本中保留原稿。"""
+    rules = {**RULES, "max_cps": 5.0, "max_duration_ms": 2000, "max_offset_ms": 100}
+    pid = _make_project(rules=rules)
+    vid = _upload(pid, VTT_TAGGED)
+    r = client.post(f"/projects/{pid}/versions/{vid}/autofix")
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["conflicts"], body
+    assert body["conflicts"][0]["cue_index"] == 1
+    assert body["conflicts"][0]["reasons"]
+    # 冲突字幕在新版本中保持原稿（含标签）
+    fixed = client.get(f"/projects/{pid}/versions/{body['new_version_id']}").json()
+    assert fixed["cues"][0]["lines"] == [
+        "<v 张三><i>你好世界。这是一句带标签的长台词，必须拆开。</i></v>"]
+    assert fixed["cues"][0]["start_ms"] == 1000
+    assert fixed["cues"][0]["end_ms"] == 3000
