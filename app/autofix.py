@@ -2,21 +2,22 @@
 
 设计原则：
 - 每条字幕在其“时间窗”内修复：窗口由允许偏移上限、相邻字幕位置
-  （保留最小间隔）和镜头切点共同限定；
+  （保留最小间隔）和镜头切点共同限定，窗口边界全部在**帧域**给出；
 - 阅读速度 / 最长显示时间无法满足时，按句末标点 → 从句标点 → 原子硬拆
-  的顺序拆分字幕，并按可见字数比例分配时间；
-- 修复后的时间点按帧率对齐；
+  的顺序拆分字幕，并按可见字数比例分配帧；
+- 所有结果天然落在合法帧上（整数帧号），无需再做浮点“帧对齐”；
 - 规则冲突无法消解的字幕保留原稿，并作为冲突项返回（不覆盖原稿）。
 """
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass
+from fractions import Fraction
 
-from .parsing import Cue, format_timestamp, join_lines, strip_tags, visible_len
+from .parsing import Cue, join_lines, strip_tags, visible_len
 from .qc import CLOSING_PUNCT, OPENING_PUNCT
 from .schemas import Rules
+from .timecode import Timebase, ceil_pos, format_smpte
 
 # ---------------------------------------------------------------- 分词
 
@@ -308,13 +309,6 @@ def _hard_split(text: str) -> list[str]:
     return [_units_text(units[:best_k]), _units_text(units[best_k:])]
 
 
-def _need_ms(chars: int, rules: Rules) -> int:
-    """满足阅读速度所需的最短显示时长。"""
-    if chars <= 0:
-        return rules.min_duration_ms
-    return max(rules.min_duration_ms, math.ceil(chars / rules.max_cps * 1000))
-
-
 def split_text(text: str, rules: Rules, depth: int = 0) -> list[str]:
     """把一段文本拆成多条：句末标点 → 从句标点 → 原子硬拆，超长段递归。"""
     pieces = _split_at(text, _split_positions(text, _SENT_ENDERS))
@@ -328,7 +322,10 @@ def split_text(text: str, rules: Rules, depth: int = 0) -> list[str]:
         return pieces
     out: list[str] = []
     for p in pieces:
-        if _need_ms(visible_len(p), rules) > rules.max_duration_ms and visible_len(p) > 1:
+        # 以毫秒规则粗判是否需要继续递归拆分（精确时间运算在帧域进行）
+        need_ms = max(rules.min_duration_ms,
+                      -((-visible_len(p) * 1000) // int(rules.max_cps)) if visible_len(p) else 0)
+        if need_ms > rules.max_duration_ms and visible_len(p) > 1:
             sub = split_text(p, rules, depth + 1)
             if len(sub) > 1:
                 out.extend(sub)
@@ -337,11 +334,41 @@ def split_text(text: str, rules: Rules, depth: int = 0) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------- 帧域换算
+
+def _need_frames(chars: int, rules: Rules, tb: Timebase) -> int:
+    """满足最短显示时间与阅读速度所需的最少帧数（向上取整）。"""
+    dur = ceil_pos(Fraction(rules.min_duration_ms) * tb.rate / 1000)
+    if chars > 0:
+        cps = Fraction(str(rules.max_cps))
+        dur = max(dur, ceil_pos(Fraction(chars) / cps * tb.rate))
+    return dur
+
+
+def _max_frames(rules: Rules, tb: Timebase) -> int:
+    """最长显示时间对应的帧数：不超过该时长的最大整数帧（向下取整）。"""
+    return Fraction(rules.max_duration_ms) * tb.rate // 1000
+
+
+def _gap_frames(rules: Rules, tb: Timebase) -> int:
+    return ceil_pos(Fraction(rules.min_gap_ms) * tb.rate / 1000)
+
+
+def _offset_frames(rules: Rules, tb: Timebase) -> int:
+    """允许偏移上限换算为帧：半向上取整（最近合法帧）。"""
+    from .timecode import half_up
+    return half_up(Fraction(rules.max_offset_ms) * tb.rate / 1000)
+
+
+def _tc(f: int, tb: Timebase) -> str:
+    return format_smpte(tb, f)
+
+
 # ---------------------------------------------------------------- 时间窗放置
 
 def _place(dur_need: int, slo: int, shi: int, elo: int, ehi: int,
            orig_s: int, orig_e: int) -> tuple[int, int] | None:
-    """在 [slo,shi]×[elo,ehi] 窗口内放置时长至少 dur_need 的字幕。
+    """在 [slo,shi]×[elo,ehi] 帧窗口内放置时长至少 dur_need 的字幕。
 
     优先贴近原始起止时间；放不下时尝试向前挪。返回 (start, end) 或 None。
     """
@@ -360,60 +387,50 @@ def _place(dur_need: int, slo: int, shi: int, elo: int, ehi: int,
     return None
 
 
-def _snap(s: int, e: int, frame: float | None, need: int, ehi: int) -> tuple[int, int]:
-    """按帧对齐：起点向上、终点向下取整；时长不足时在窗口内补足。"""
-    if not frame:
-        return s, e
-    s2 = int(math.ceil(s / frame - 1e-6) * frame)
-    e2 = int(math.floor(e / frame + 1e-6) * frame)
-    while e2 - s2 < need and e2 + frame <= ehi + 1e-6:
-        e2 += int(round(frame))
-    if e2 <= s2:
-        e2 = s2 + int(round(frame))
-    return s2, e2
-
-
 # ---------------------------------------------------------------- 校验
 
 def _validate(cue: Cue, prev_end: int | None, rules: Rules,
-              cuts: list[int]) -> list[tuple[str, str]]:
-    """修复结果的硬性校验，返回 (类型, 说明) 列表。"""
+              cuts: list[int], tb: Timebase) -> list[tuple[str, str]]:
+    """修复结果的硬性校验（帧域），返回 (类型, 说明) 列表。"""
     problems: list[tuple[str, str]] = []
-    dur = cue.duration_ms
-    if dur < rules.min_duration_ms:
-        problems.append(("flash", f"显示时长 {dur}ms 低于下限 {rules.min_duration_ms}ms"))
-    if dur > rules.max_duration_ms:
+    dur = cue.duration_frames
+    if dur < _need_frames(0, rules, tb):
+        problems.append(("flash", f"显示时长 {dur} 帧低于下限 {rules.min_duration_ms}ms"))
+    if Fraction(dur) > Fraction(rules.max_duration_ms) * tb.rate / 1000:
         problems.append(("duration_too_long",
-                         f"显示时长 {dur}ms 超过上限 {rules.max_duration_ms}ms"))
+                         f"显示时长 {dur} 帧超过上限 {rules.max_duration_ms}ms"))
     chars = sum(visible_len(ln) for ln in cue.lines)
-    if dur > 0 and chars / (dur / 1000.0) > rules.max_cps + 1e-6:
+    if dur > 0 and Fraction(chars) * tb.rate > Fraction(str(rules.max_cps)) * dur:
         problems.append(("cps_exceeded", "阅读速度仍超限"))
     if len(cue.lines) > rules.max_lines:
         problems.append(("too_many_lines", "行数仍超限"))
     for no, ln in enumerate(cue.lines, 1):
         if visible_len(ln) > rules.max_chars_per_line:
             problems.append(("line_too_long", f"第 {no} 行仍超宽"))
-    if prev_end is not None and cue.start_ms < prev_end + rules.min_gap_ms:
+    gap = _gap_frames(rules, tb)
+    if prev_end is not None and cue.start_frame < prev_end + gap:
         problems.append(("overlap", "与前一条字幕间隔不足"))
-    tol = rules.shot_tolerance_ms
+    tol = Fraction(rules.shot_tolerance_ms) * tb.rate / 1000
     for c in cuts:
-        if cue.start_ms + tol < c < cue.end_ms - tol:
-            problems.append(("shot_cross", f"仍跨越镜头切点 {c}ms"))
+        if Fraction(cue.start_frame) + tol < c < Fraction(cue.end_frame) - tol:
+            problems.append(("shot_cross", f"仍跨越镜头切点 {_tc(c, tb)}"))
     return problems
 
 
 def _conflict_reasons(cue: Cue, rules: Rules, need: int,
-                      slo: int, shi: int, elo: int, ehi: int) -> list[str]:
+                      slo: int, shi: int, elo: int, ehi: int,
+                      tb: Timebase) -> list[str]:
     reasons: list[str] = []
     if shi < slo or ehi < elo:
         reasons.append("允许偏移范围与相邻字幕/镜头切点约束冲突，可用时间窗无效")
-    window = ehi - slo
-    if need > rules.max_duration_ms:
+    max_dur = _max_frames(rules, tb)
+    if need > max_dur:
         reasons.append(
-            f"按每秒 {rules.max_cps} 字需 {need}ms，超过最长显示时间 "
-            f"{rules.max_duration_ms}ms，且文本无法进一步拆分")
+            f"按每秒 {rules.max_cps} 字需 {need} 帧，超过最长显示时间 "
+            f"{rules.max_duration_ms}ms（{max_dur} 帧），且文本无法进一步拆分")
+    window = ehi - slo
     if 0 <= window < need:
-        reasons.append(f"满足阅读速度需 {need}ms，可用时间窗仅 {window}ms")
+        reasons.append(f"满足阅读速度需 {need} 帧，可用时间窗仅 {window} 帧")
     total = visible_len(join_lines(cue.lines))
     if total > rules.max_chars_per_line * rules.max_lines:
         reasons.append("文本超出最大行数可容纳字数，且时间窗内无法拆分")
@@ -428,16 +445,21 @@ def auto_fix(
     cues: list[Cue],
     rules: Rules,
     shot_cuts: list[int] | None = None,
-    frame_rate: float | None = None,
+    tb: Timebase | None = None,
 ) -> tuple[list[Cue], list[dict], list[dict]]:
-    """自动修复字幕。
+    """自动修复字幕（全部在帧域进行）。
 
     返回 (修复后的 cue 列表, 已应用修复列表, 冲突列表)。
     冲突字幕在新列表中保持原稿不变。
     """
-    frame = 1000.0 / frame_rate if frame_rate and frame_rate > 0 else None
+    if tb is None:
+        from .timecode import build_timebase
+        tb = build_timebase(25)
     cuts = sorted(shot_cuts or [])
-    off, gap = rules.max_offset_ms, rules.min_gap_ms
+    off = _offset_frames(rules, tb)
+    gap = _gap_frames(rules, tb)
+    max_dur = _max_frames(rules, tb)
+    tol = Fraction(rules.shot_tolerance_ms) * tb.rate / 1000
     out: list[Cue] = []
     applied: list[dict] = []
     conflicts: list[dict] = []
@@ -445,39 +467,37 @@ def auto_fix(
 
     for i, cue in enumerate(cues):
         nxt = cues[i + 1] if i + 1 < len(cues) else None
-        # ---- 可用时间窗 ----
-        slo = max(0, cue.start_ms - off)
-        shi = cue.start_ms + off
+        # ---- 可用时间窗（帧） ----
+        slo = max(0, cue.start_frame - off)
+        shi = cue.start_frame + off
         if prev_end is not None:
             slo = max(slo, prev_end + gap)
-        elo = cue.end_ms - off
-        ehi = cue.end_ms + off
+        elo = cue.end_frame - off
+        ehi = cue.end_frame + off
         if nxt is not None:
-            ehi = min(ehi, nxt.start_ms - gap)
-        tol = rules.shot_tolerance_ms
-        cut_after = next((c for c in cuts if c > cue.start_ms + tol), None)
+            ehi = min(ehi, nxt.start_frame - gap)
+        cut_after = next((c for c in cuts if Fraction(c) > Fraction(cue.start_frame) + tol), None)
         if cut_after is not None:
             ehi = min(ehi, cut_after)
 
         text = join_lines(cue.lines)
         chars = visible_len(text)
-        need = _need_ms(chars, rules)
+        need = _need_frames(chars, rules, tb)
         new_cues: list[Cue] | None = None
         actions: list[str] = []
 
         # ---- 方案一：整条放置 ----
-        if need <= rules.max_duration_ms:
-            placed = _place(need, slo, shi, elo, ehi, cue.start_ms, cue.end_ms)
+        if need <= max_dur:
+            placed = _place(need, slo, shi, elo, ehi, cue.start_frame, cue.end_frame)
             if placed:
                 s, e = placed
                 lines = rewrap(text, rules)
                 if len(lines) <= rules.max_lines:
                     new_cues = [Cue(cue.index, s, e, lines, cue.identifier, cue.settings)]
-                    if (s, e) != (cue.start_ms, cue.end_ms):
+                    if (s, e) != (cue.start_frame, cue.end_frame):
                         actions.append(
-                            f"调整时间轴 {format_timestamp(cue.start_ms, 'vtt')}–"
-                            f"{format_timestamp(cue.end_ms, 'vtt')} → "
-                            f"{format_timestamp(s, 'vtt')}–{format_timestamp(e, 'vtt')}")
+                            f"调整时间轴 {_tc(cue.start_frame, tb)}–"
+                            f"{_tc(cue.end_frame, tb)} → {_tc(s, tb)}–{_tc(e, tb)}")
                     if lines != cue.lines:
                         actions.append("按标点与行长重新分行")
 
@@ -485,13 +505,12 @@ def auto_fix(
         if new_cues is None:
             pieces = split_text(text, rules)
             if len(pieces) >= 2:
-                needs = [_need_ms(visible_len(p), rules) for p in pieces]
+                needs = [_need_frames(visible_len(p), rules, tb) for p in pieces]
                 total = sum(needs) + gap * (len(pieces) - 1)
-                s0 = min(max(cue.start_ms, slo), shi)
+                s0 = min(max(cue.start_frame, slo), shi)
                 if s0 + total > ehi:
                     s0 = ehi - total
-                if slo <= s0 <= shi and s0 + total <= ehi and all(
-                        nd <= rules.max_duration_ms for nd in needs):
+                if slo <= s0 <= shi and s0 + total <= ehi and all(nd <= max_dur for nd in needs):
                     trial: list[Cue] = []
                     s = s0
                     for p, nd in zip(pieces, needs):
@@ -503,38 +522,19 @@ def auto_fix(
                         s += nd + gap
                     else:
                         new_cues = trial
-                        actions.append(f"按句子拆分为 {len(pieces)} 条并重新分配时间轴")
+                        actions.append(f"按句子拆分为 {len(pieces)} 条并重新分配帧位置")
 
-        # ---- 帧对齐 + 校验 ----
+        # ---- 帧合法 + 校验（整数帧天然对齐，仅需检查窗口/规则） ----
         if new_cues is not None:
-            snapped: list[Cue] = []
-            pe = prev_end
-            for c in new_cues:
-                need_c = _need_ms(sum(visible_len(l) for l in c.lines), rules)
-                s, e = _snap(c.start_ms, c.end_ms, frame, need_c, ehi)
-                if pe is not None and s < pe + gap:
-                    # 帧对齐不得侵蚀与前一条的最小间隔
-                    s = pe + gap
-                    if frame:
-                        s = int(math.ceil(s / frame - 1e-6) * frame)
-                    e = max(e, s + need_c)
-                    if frame:
-                        e = int(math.floor(e / frame + 1e-6) * frame)
-                        while e - s < need_c and e + frame <= ehi + 1e-6:
-                            e += int(round(frame))
-                snapped.append(Cue(cue.index, s, e, c.lines, c.identifier, c.settings))
-                pe = e
             problems: list[tuple[str, str]] = []
             pe = prev_end
-            for c in snapped:
-                if c.end_ms > ehi:
-                    problems.append(("window_exceeded", "帧对齐后超出可用时间窗"))
-                problems.extend(_validate(c, pe, rules, cuts))
-                pe = c.end_ms
+            for c in new_cues:
+                if c.end_frame > ehi:
+                    problems.append(("window_exceeded", "修复后超出可用时间窗"))
+                problems.extend(_validate(c, pe, rules, cuts, tb))
+                pe = c.end_frame
             if problems:
                 new_cues = None
-            else:
-                new_cues = snapped
 
         # ---- 落定或保留原稿 ----
         if new_cues is None:
@@ -542,12 +542,12 @@ def auto_fix(
             conflicts.append({
                 "cue_index": cue.index,
                 "message": "无法在规则约束内修复，已保留原稿",
-                "reasons": _conflict_reasons(cue, rules, need, slo, shi, elo, ehi),
+                "reasons": _conflict_reasons(cue, rules, need, slo, shi, elo, ehi, tb),
             })
-            prev_end = cue.end_ms
+            prev_end = cue.end_frame
             continue
         out.extend(new_cues)
-        prev_end = new_cues[-1].end_ms
+        prev_end = new_cues[-1].end_frame
         if actions:
             applied.append({"cue_index": cue.index, "actions": actions})
 

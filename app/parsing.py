@@ -3,13 +3,19 @@
 解析时保留说话人标签（如 ``<v 张三>``、``- 张三：``）与基础样式标签
 （``<i>``、``<b>``、``<u>``、``<font>`` 等），所有检测均基于去除标签后的
 可见文本。
+
+时间轴以**精确帧号**为唯一真值（``start_frame`` / ``end_frame``）：
+毫秒时间戳通过项目时间基半向上取整换算到帧；导出时帧再换算回毫秒，
+全过程使用有理数运算，不产生浮点舍入漂移。
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 
-# ---------------------------------------------------------------- 时间戳
+from .timecode import Timebase, TimecodeError
+
+# ---------------------------------------------------------------- 毫秒时间戳（旧格式，仅解析阶段使用）
 
 _TS_FULL = re.compile(r"^(\d{1,3}):(\d{1,2}):(\d{1,2})[,.](\d{1,3})$")
 _TS_SHORT = re.compile(r"^(\d{1,2}):(\d{1,2})[,.](\d{1,3})$")
@@ -29,8 +35,12 @@ def parse_timestamp(text: str) -> int:
     raise ValueError(f"无法解析时间戳: {text!r}")
 
 
+def _timestamp_to_frames(text: str, tb: Timebase, field: str) -> int:
+    return tb.ms_to_frames(parse_timestamp(text))
+
+
 def format_timestamp(ms: int | float, fmt: str = "srt") -> str:
-    """把毫秒格式化为 SRT（逗号）或 VTT（句点）时间戳。"""
+    """把毫秒格式化为 SRT（逗号）或 VTT（句点）时间戳（仅旧调用/测试使用）。"""
     sep = "," if fmt == "srt" else "."
     ms = max(0, int(round(ms)))
     h, rem = divmod(ms, 3_600_000)
@@ -39,39 +49,73 @@ def format_timestamp(ms: int | float, fmt: str = "srt") -> str:
     return f"{h:02d}:{mi:02d}:{s:02d}{sep}{milli:03d}"
 
 
+def format_frame_timestamp(frame: int, tb: Timebase, fmt: str = "srt") -> str:
+    """把时间线帧号格式化为 SRT（逗号）或 VTT（句点）毫秒时间戳。"""
+    ms = tb.frames_to_ms(frame)
+    return format_timestamp(ms, fmt)
+
+
 # ---------------------------------------------------------------- 数据结构
 
 @dataclass
 class Cue:
-    """一条字幕。lines 保留原始文本（含说话人标签与样式标签）。"""
+    """一条字幕。lines 保留原始文本（含说话人标签与样式标签）。
+
+    时间以帧号表示；毫秒为时间基的派生量。
+    """
 
     index: int
-    start_ms: int
-    end_ms: int
+    start_frame: int
+    end_frame: int
     lines: list[str]
     identifier: str | None = None  # WebVTT cue 标识符
     settings: str | None = None    # WebVTT cue 设置（位置/对齐等）
 
     @property
-    def duration_ms(self) -> int:
-        return self.end_ms - self.start_ms
+    def duration_frames(self) -> int:
+        return self.end_frame - self.start_frame
+
+    def start_ms(self, tb: Timebase) -> int:
+        return tb.frames_to_ms(self.start_frame)
+
+    def end_ms(self, tb: Timebase) -> int:
+        return tb.frames_to_ms(self.end_frame)
+
+    def duration_ms(self, tb: Timebase) -> int:
+        return self.end_ms(tb) - self.start_ms(tb)
+
+    def start_tc(self, tb: Timebase) -> str:
+        from .timecode import format_smpte
+        return format_smpte(tb, self.start_frame)
+
+    def end_tc(self, tb: Timebase) -> str:
+        from .timecode import format_smpte
+        return format_smpte(tb, self.end_frame)
 
     def to_dict(self) -> dict:
         return {
             "index": self.index,
-            "start_ms": self.start_ms,
-            "end_ms": self.end_ms,
+            "start_frame": self.start_frame,
+            "end_frame": self.end_frame,
             "lines": list(self.lines),
             "identifier": self.identifier,
             "settings": self.settings,
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Cue":
+    def from_dict(cls, d: dict, tb: Timebase | None = None) -> "Cue":
+        if "start_frame" in d and "end_frame" in d:
+            sf, ef = int(d["start_frame"]), int(d["end_frame"])
+        elif tb is not None and "start_ms" in d and "end_ms" in d:
+            # 旧版数据迁移：毫秒按项目时间基换算到帧
+            sf = tb.ms_to_frames(int(d["start_ms"]))
+            ef = tb.ms_to_frames(int(d["end_ms"]))
+        else:
+            raise ValueError("cue 快照缺少帧位置字段，且无时间基可用于毫秒迁移")
         return cls(
             index=int(d["index"]),
-            start_ms=int(d["start_ms"]),
-            end_ms=int(d["end_ms"]),
+            start_frame=sf,
+            end_frame=ef,
             lines=list(d["lines"]),
             identifier=d.get("identifier"),
             settings=d.get("settings"),
@@ -108,7 +152,7 @@ def is_cjk(ch: str) -> bool:
         "⺀" <= ch <= "鿿"      # CJK 部首补充 / 统一表意文字
         or "　" <= ch <= "〿"   # CJK 符号与标点
         or "＀" <= ch <= "￯"   # 全角字符
-        or "豈" <= ch <= "﫿"   # CJK 兼容表意文字
+        or "豈" <= ch <= "﫿"   # CJK 兼容表意文字
     )
 
 
@@ -134,7 +178,7 @@ _TIMING_LINE = re.compile(r"^(?P<a>\S+)\s*-->\s*(?P<b>\S+)(?P<rest>.*)$")
 
 
 def _normalize(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    return text.replace("\r\n", "\n").replace("\r", "\n").lstrip("﻿")
 
 
 def _split_blocks(text: str) -> list[list[str]]:
@@ -146,17 +190,27 @@ def _split_blocks(text: str) -> list[list[str]]:
     return blocks
 
 
-def _parse_timing(line: str) -> tuple[int, int, str | None]:
+def _parse_timing(line: str, tb: Timebase, cue_no: int) -> tuple[int, int, str | None]:
     m = _TIMING_LINE.match(line.strip())
     if not m:
-        raise ValueError(f"时间轴行无法解析: {line!r}")
-    start, end = parse_timestamp(m["a"]), parse_timestamp(m["b"])
+        raise TimecodeError(f"cue[{cue_no}].timing", line, "时间轴行无法解析")
+    try:
+        start = _timestamp_to_frames(m["a"], tb, f"cue[{cue_no}].start")
+    except ValueError:
+        raise TimecodeError(f"cue[{cue_no}].start", m["a"], "无法解析的开始时间戳")
+    try:
+        end = _timestamp_to_frames(m["b"], tb, f"cue[{cue_no}].end")
+    except ValueError:
+        raise TimecodeError(f"cue[{cue_no}].end", m["b"], "无法解析的结束时间戳")
     if end <= start:
-        raise ValueError(f"字幕结束时间必须大于开始时间: {line!r}")
+        raise TimecodeError(
+            f"cue[{cue_no}].end", m["b"],
+            f"结束时间必须晚于开始时间（{m['a']}），换算到帧后 end_frame={end} "
+            f"<= start_frame={start}")
     return start, end, (m["rest"].strip() or None)
 
 
-def parse_srt(text: str) -> list[Cue]:
+def parse_srt(text: str, tb: Timebase) -> list[Cue]:
     text = _normalize(text)
     cues: list[Cue] = []
     for lines in _split_blocks(text):
@@ -165,14 +219,14 @@ def parse_srt(text: str) -> list[Cue]:
             lines = lines[1:]
         if not lines:
             continue
-        start, end, settings = _parse_timing(lines[0])
+        start, end, settings = _parse_timing(lines[0], tb, len(cues) + 1)
         cues.append(Cue(len(cues) + 1, start, end, lines[1:], settings=settings))
     if not cues:
-        raise ValueError("未解析到任何字幕块")
+        raise TimecodeError("content", text[:80], "未解析到任何字幕块")
     return cues
 
 
-def parse_vtt(text: str) -> list[Cue]:
+def parse_vtt(text: str, tb: Timebase) -> list[Cue]:
     text = _normalize(text)
     if not text.startswith("WEBVTT"):
         raise ValueError("不是有效的 WebVTT 文件（缺少 WEBVTT 头）")
@@ -194,11 +248,11 @@ def parse_vtt(text: str) -> list[Cue]:
             if not block:
                 continue
             head = block[0].strip()
-        start, end, settings = _parse_timing(head)
+        start, end, settings = _parse_timing(head, tb, len(cues) + 1)
         cues.append(Cue(len(cues) + 1, start, end, block[1:],
                         identifier=identifier, settings=settings))
     if not cues:
-        raise ValueError("未解析到任何字幕块")
+        raise TimecodeError("content", text[:80], "未解析到任何字幕块")
     return cues
 
 
@@ -211,36 +265,38 @@ def detect_format(text: str) -> str:
     raise ValueError("无法识别字幕格式（既非 SRT 也非 WebVTT）")
 
 
-def parse_subtitles(text: str, fmt: str = "auto") -> tuple[list[Cue], str]:
+def parse_subtitles(text: str, tb: Timebase, fmt: str = "auto") -> tuple[list[Cue], str]:
     """解析字幕文本，返回 (cue 列表, 实际格式 "srt"/"vtt")。"""
     if fmt == "auto":
         fmt = detect_format(text)
     if fmt == "srt":
-        return parse_srt(text), "srt"
+        return parse_srt(text, tb), "srt"
     if fmt == "vtt":
-        return parse_vtt(text), "vtt"
+        return parse_vtt(text, tb), "vtt"
     raise ValueError(f"不支持的字幕格式: {fmt!r}")
 
 
 # ---------------------------------------------------------------- 序列化
 
-def serialize_srt(cues: list[Cue]) -> str:
+def serialize_srt(cues: list[Cue], tb: Timebase) -> str:
     parts = []
     for i, c in enumerate(cues, 1):
-        timing = f"{format_timestamp(c.start_ms, 'srt')} --> {format_timestamp(c.end_ms, 'srt')}"
+        timing = (f"{format_frame_timestamp(c.start_frame, tb, 'srt')} --> "
+                  f"{format_frame_timestamp(c.end_frame, tb, 'srt')}")
         if c.settings:
             timing += f" {c.settings}"
         parts.append("\n".join([str(i), timing, *c.lines]))
     return "\n\n".join(parts) + "\n"
 
 
-def serialize_vtt(cues: list[Cue]) -> str:
+def serialize_vtt(cues: list[Cue], tb: Timebase) -> str:
     parts = ["WEBVTT"]
     for c in cues:
         block: list[str] = []
         if c.identifier:
             block.append(c.identifier)
-        timing = f"{format_timestamp(c.start_ms, 'vtt')} --> {format_timestamp(c.end_ms, 'vtt')}"
+        timing = (f"{format_frame_timestamp(c.start_frame, tb, 'vtt')} --> "
+                  f"{format_frame_timestamp(c.end_frame, tb, 'vtt')}")
         if c.settings:
             timing += f" {c.settings}"
         block.append(timing)
@@ -249,31 +305,25 @@ def serialize_vtt(cues: list[Cue]) -> str:
     return "\n\n".join(parts) + "\n"
 
 
-def serialize(cues: list[Cue], fmt: str) -> str:
-    return serialize_srt(cues) if fmt == "srt" else serialize_vtt(cues)
+def serialize(cues: list[Cue], tb: Timebase, fmt: str) -> str:
+    return serialize_srt(cues, tb) if fmt == "srt" else serialize_vtt(cues, tb)
 
 
 # ---------------------------------------------------------------- 镜头切点
 
-def parse_shot_cuts(items: list) -> list[int]:
-    """把镜头切点列表规范化为升序毫秒列表。
+def parse_shot_cuts(items: list, tb: Timebase) -> list[int]:
+    """把镜头切点列表统一换算为升序去重的**时间线帧号**列表。
 
-    数字按毫秒处理；字符串支持 ``HH:MM:SS.mmm`` 等时间戳或纯数字（毫秒）。
+    数字与纯数字字符串按毫秒（半向上取整到帧）；``"NNNf"`` 为绝对帧号；
+    ``HH:MM:SS:FF`` / ``HH:MM:SS;FF`` 为 SMPTE 时间码；
+    旧格式 ``HH:MM:SS.mmm`` 按毫秒。
     """
+    from .timecode import resolve_frame_field
+
     cuts: list[int] = []
-    for it in items or []:
+    for no, it in enumerate(items or []):
+        field = f"shot_cuts[{no}]"
         if isinstance(it, bool):
-            raise ValueError(f"无法解析镜头切点: {it!r}")
-        if isinstance(it, (int, float)):
-            if it < 0:
-                raise ValueError("镜头切点不能为负数")
-            cuts.append(int(round(it)))
-        elif isinstance(it, str):
-            s = it.strip()
-            if re.fullmatch(r"\d+(\.\d+)?", s):
-                cuts.append(int(round(float(s))))
-            else:
-                cuts.append(parse_timestamp(s))
-        else:
-            raise ValueError(f"无法解析镜头切点: {it!r}")
+            raise TimecodeError(field, it, "切点不能为布尔值")
+        cuts.append(resolve_frame_field(it, tb, field))
     return sorted(set(cuts))

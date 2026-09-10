@@ -1,14 +1,18 @@
-"""字幕断行与时间轴校正 REST API。
+"""字幕断行与时间轴校正 REST API（SMPTE 时间码版）。
 
-全部处理在本地完成，不依赖外部模型或服务。
+全部处理在本地完成，不依赖任何外部模型或服务。时间轴以精确帧号为真值，
+毫秒/SMPTE 时间码/帧号三种表示经项目时间基（有理数帧率 + NDF/DF +
+起始时间码）互转，往返无浮点舍入漂移。
 """
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from fractions import Fraction
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import PlainTextResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy.orm import Session
 
 from .autofix import auto_fix
@@ -20,7 +24,12 @@ from .qc import run_qc, summarize
 from .schemas import (
     AutoFixRequest,
     AutoFixResponse,
+    ConvertedPosition,
+    ConvertRequest,
+    CueOut,
     DiffResponse,
+    FrameCueOut,
+    FrameExport,
     ProjectCreate,
     ProjectOut,
     QCReport,
@@ -28,9 +37,19 @@ from .schemas import (
     RuleTemplateOut,
     RuleTemplateUpdate,
     Rules,
+    StandaloneConvertRequest,
+    TimebaseOut,
+    TimebaseSpec,
     VersionCreate,
     VersionDetail,
     VersionOut,
+)
+from .timecode import (
+    Timebase,
+    TimecodeError,
+    build_timebase,
+    format_smpte,
+    resolve_frame_field,
 )
 
 
@@ -44,11 +63,39 @@ init_db()  # 导入即建表（幂等），保证直接运行时数据库可用
 
 
 app = FastAPI(
-    title="字幕断行与时间轴校正 API",
-    description="供字幕制作团队校正影视字幕断行和时间轴的本地服务",
-    version="1.0.0",
+    title="字幕断行与时间轴校正 API（SMPTE 时间码）",
+    description="供字幕制作团队校正影视字幕断行和时间轴的本地服务，支持 SMPTE 时间码与有理数帧运算",
+    version="2.0.0",
     lifespan=lifespan,
 )
+
+
+# ---------------------------------------------------------------- 错误处理
+
+@app.exception_handler(TimecodeError)
+async def timecode_error_handler(request: Request, exc: TimecodeError):
+    """时间码/帧位置错误统一 400：返回字段、原值和原因。"""
+    return JSONResponse(
+        status_code=400,
+        content={"detail": {"errors": [
+            {"field": exc.field, "value": exc.value, "reason": exc.reason}]}},
+    )
+
+
+def _position_errors_400(errors: list[dict]) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"detail": {"errors": errors}})
+
+
+class _PositionErrors(Exception):
+    """多个位置字段错误聚合，一次性返回。"""
+
+    def __init__(self, errors: list[dict]):
+        self.errors = errors
+
+
+@app.exception_handler(_PositionErrors)
+async def position_errors_handler(request: Request, exc: _PositionErrors):
+    return _position_errors_400(exc.errors)
 
 
 # ---------------------------------------------------------------- 工具
@@ -67,9 +114,36 @@ def _get_version(db: Session, project_id: int, version_id: int) -> Version:
     return v
 
 
+def _project_tb(p: Project) -> Timebase:
+    return build_timebase(
+        Fraction(p.rate_num, p.rate_den),
+        drop_frame=bool(p.drop_frame),
+        start_timecode=p.start_timecode,
+    )
+
+
+def _tb_out(p: Project) -> TimebaseOut:
+    tb = _project_tb(p)
+    return TimebaseOut(
+        fps=float(tb.rate), fps_label=tb.fps_label,
+        rate_num=tb.rate.numerator, rate_den=tb.rate.denominator,
+        drop_frame=tb.drop_frame, start_timecode=tb.start_timecode)
+
+
+def _build_timebase(spec: TimebaseSpec | None, frame_rate: float | None) -> Timebase:
+    if spec is not None:
+        return build_timebase(spec.fps, drop_frame=spec.drop_frame,
+                              start_timecode=spec.start_timecode)
+    # 旧字段：浮点帧率按十进制精确值处理（NDF）
+    return build_timebase(25.0 if frame_rate is None else frame_rate)
+
+
 def _project_out(p: Project) -> ProjectOut:
+    tb = _project_tb(p)
     return ProjectOut(
-        id=p.id, name=p.name, frame_rate=p.frame_rate, shot_cuts=p.shot_cuts,
+        id=p.id, name=p.name, frame_rate=float(tb.rate), timebase=_tb_out(p),
+        shot_cuts=list(p.shot_cuts or []),
+        shot_cuts_ms=[tb.frames_to_ms(c) for c in (p.shot_cuts or [])],
         rules=Rules(**p.rules), rule_template_id=p.rule_template_id,
         version_count=len(p.versions), created_at=p.created_at,
     )
@@ -82,20 +156,65 @@ def _version_out(v: Version) -> VersionOut:
     )
 
 
-def _cues_of(v: Version) -> list[Cue]:
-    return [Cue.from_dict(d) for d in v.cues]
+def _cues_of(v: Version, tb: Timebase) -> list[Cue]:
+    return [Cue.from_dict(d, tb) for d in v.cues]
+
+
+def _cue_out(c: Cue, tb: Timebase) -> CueOut:
+    return CueOut(
+        index=c.index, start_frame=c.start_frame, end_frame=c.end_frame,
+        start_ms=tb.frames_to_ms(c.start_frame), end_ms=tb.frames_to_ms(c.end_frame),
+        start_tc=format_smpte(tb, c.start_frame), end_tc=format_smpte(tb, c.end_frame),
+        lines=c.lines, identifier=c.identifier, settings=c.settings,
+    )
 
 
 def _build_report(project: Project, version: Version) -> QCReport:
-    cues = _cues_of(version)
+    tb = _project_tb(project)
+    cues = _cues_of(version, tb)
     rules = Rules(**project.rules)
-    issues = run_qc(cues, rules, project.shot_cuts, project.frame_rate)
+    issues = run_qc(cues, rules, list(project.shot_cuts or []), tb)
     return QCReport(
         project_id=project.id, version_id=version.id,
         generated_at=datetime.now(timezone.utc),
-        rules=rules, frame_rate=project.frame_rate, shot_cuts=project.shot_cuts,
+        rules=rules, timebase=_tb_out(project),
+        shot_cuts=list(project.shot_cuts or []),
         summary={"cue_count": len(cues), **summarize(issues)}, issues=issues,
     )
+
+
+def _position_value(pos: Any) -> Any:
+    return pos.model_dump(exclude_none=True) if hasattr(pos, "model_dump") else pos
+
+
+def _structured_cues(cue_inputs: list, tb: Timebase) -> list[Cue]:
+    """把结构化 cue 请求换算为帧；收集全部字段错误后一次性 400。"""
+    errors: list[dict] = []
+    cues: list[Cue] = []
+    for i, ci in enumerate(cue_inputs):
+        try:
+            sf = resolve_frame_field(_position_value(ci.start), tb, f"cues[{i}].start")
+        except TimecodeError as e:
+            errors.append({"field": e.field, "value": e.value, "reason": e.reason})
+            sf = None
+        try:
+            ef = resolve_frame_field(_position_value(ci.end), tb, f"cues[{i}].end")
+        except TimecodeError as e:
+            errors.append({"field": e.field, "value": e.value, "reason": e.reason})
+            ef = None
+        if sf is not None and ef is not None:
+            if ef <= sf:
+                errors.append({
+                    "field": f"cues[{i}].end", "value": _position_value(ci.end),
+                    "reason": (f"结束帧必须晚于开始帧：end_frame={ef} <= "
+                               f"start_frame={sf}"),
+                })
+            else:
+                lines = ci.lines if isinstance(ci.lines, list) else [ci.lines]
+                cues.append(Cue(i + 1, sf, ef, lines, ci.identifier, ci.settings))
+    if errors:
+        raise _PositionErrors(errors)
+    return cues
 
 
 # ---------------------------------------------------------------- 基本信息
@@ -103,14 +222,15 @@ def _build_report(project: Project, version: Version) -> QCReport:
 @app.get("/")
 def root():
     return {
-        "service": "字幕断行与时间轴校正 API",
-        "version": "1.0.0",
+        "service": "字幕断行与时间轴校正 API（SMPTE 时间码）",
+        "version": "2.0.0",
         "docs": "/docs",
         "endpoints": [
             "/rule-templates", "/projects", "/projects/{id}/versions",
             "/projects/{id}/versions/{vid}/qc",
             "/projects/{id}/versions/{vid}/autofix",
             "/projects/{id}/versions/{vid}/export", "/projects/{id}/diff",
+            "/projects/{id}/convert", "/timecode/convert",
         ],
     }
 
@@ -183,12 +303,14 @@ def create_project(body: ProjectCreate, db: Session = Depends(get_db)):
         rules = Rules(**t.rules)
     else:
         rules = Rules()
-    try:
-        cuts = parse_shot_cuts(body.shot_cuts)
-    except ValueError as e:
-        raise HTTPException(400, f"镜头切点解析失败: {e}")
-    p = Project(name=body.name, frame_rate=body.frame_rate, shot_cuts=cuts,
-                rules=rules.model_dump(), rule_template_id=body.rule_template_id)
+    tb = _build_timebase(body.timebase, body.frame_rate)  # TimecodeError -> 400
+    cuts = parse_shot_cuts(body.shot_cuts, tb)
+    p = Project(
+        name=body.name, frame_rate=float(tb.rate),
+        rate_num=tb.rate.numerator, rate_den=tb.rate.denominator,
+        drop_frame=tb.drop_frame, start_timecode=tb.start_timecode,
+        shot_cuts=cuts, rules=rules.model_dump(),
+        rule_template_id=body.rule_template_id)
     db.add(p)
     db.commit()
     db.refresh(p)
@@ -216,13 +338,22 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
 
 @app.post("/projects/{project_id}/versions", response_model=VersionOut, status_code=201)
 def upload_version(project_id: int, body: VersionCreate, db: Session = Depends(get_db)):
-    _get_project(db, project_id)
-    try:
-        cues, fmt = parse_subtitles(body.content, body.format)
-    except ValueError as e:
-        raise HTTPException(400, f"字幕解析失败: {e}")
+    p = _get_project(db, project_id)
+    tb = _project_tb(p)
+    if body.content is not None:
+        try:
+            cues, fmt = parse_subtitles(body.content, tb, body.format)
+        except TimecodeError:
+            raise
+        except ValueError as e:
+            raise HTTPException(400, f"字幕解析失败: {e}")
+        content = body.content
+    else:
+        cues = _structured_cues(body.cues, tb)
+        fmt = "json"
+        content = serialize(cues, tb, "srt")  # 规范化 SRT 表示（真值以 cue 帧号为准）
     v = Version(project_id=project_id, label=body.label, format=fmt,
-                content=body.content, cues=[c.to_dict() for c in cues])
+                content=content, cues=[c.to_dict() for c in cues])
     db.add(v)
     db.commit()
     db.refresh(v)
@@ -238,8 +369,54 @@ def list_versions(project_id: int, db: Session = Depends(get_db)):
 
 @app.get("/projects/{project_id}/versions/{version_id}", response_model=VersionDetail)
 def get_version(project_id: int, version_id: int, db: Session = Depends(get_db)):
+    p = _get_project(db, project_id)
     v = _get_version(db, project_id, version_id)
-    return VersionDetail(**_version_out(v).model_dump(), cues=v.cues)
+    tb = _project_tb(p)
+    cues = [_cue_out(c, tb) for c in _cues_of(v, tb)]
+    return VersionDetail(**_version_out(v).model_dump(), cues=cues)
+
+
+# ---------------------------------------------------------------- 时间码换算
+
+def _convert_items(tb: Timebase, items: list) -> list[ConvertedPosition]:
+    errors: list[dict] = []
+    out: list[ConvertedPosition | None] = []
+    for i, item in enumerate(items):
+        raw = _position_value(item)
+        try:
+            frame = resolve_frame_field(raw, tb, f"items[{i}]")
+        except TimecodeError as e:
+            errors.append({"field": e.field, "value": e.value, "reason": e.reason})
+            out.append(None)
+        else:
+            exact = tb.frames_to_ms_exact(frame)
+            out.append(ConvertedPosition(
+                input=raw, frame=frame, ms=tb.frames_to_ms(frame),
+                ms_exact=f"{exact.numerator}/{exact.denominator}",
+                timecode=format_smpte(tb, frame)))
+    if errors:
+        raise _PositionErrors(errors)
+    return out  # type: ignore[return-value]
+
+
+@app.post("/projects/{project_id}/convert", response_model=list[ConvertedPosition])
+def convert_in_project(project_id: int, body: ConvertRequest,
+                       db: Session = Depends(get_db)):
+    """按项目时间基换算：毫秒 / 帧号 / SMPTE 时间码 → 帧 + 毫秒 + 时间码。"""
+    p = _get_project(db, project_id)
+    return _convert_items(_project_tb(p), body.items)
+
+
+@app.post("/timecode/convert", response_model=list[ConvertedPosition])
+def convert_standalone(body: StandaloneConvertRequest):
+    """无状态换算：请求体给出时间基（fps/drop_frame/start_timecode）与 items。
+
+    用法：``{"fps": "30000/1001", "drop_frame": true,
+    "start_timecode": "00:00:00;00", "items": ["00:00:01;00", 1000, "30f"]}``
+    """
+    tb = build_timebase(body.fps, drop_frame=body.drop_frame,
+                        start_timecode=body.start_timecode)
+    return _convert_items(tb, body.items)
 
 
 # ---------------------------------------------------------------- 质检
@@ -261,12 +438,14 @@ def autofix(project_id: int, version_id: int, body: AutoFixRequest | None = None
     """自动修复并保存为新版本；冲突项保留原稿并在响应中返回。"""
     p = _get_project(db, project_id)
     v = _get_version(db, project_id, version_id)
-    cues = _cues_of(v)
+    tb = _project_tb(p)
+    cues = _cues_of(v, tb)
     rules = Rules(**p.rules)
-    new_cues, applied, conflicts = auto_fix(cues, rules, p.shot_cuts, p.frame_rate)
+    new_cues, applied, conflicts = auto_fix(cues, rules, list(p.shot_cuts or []), tb)
     label = (body.label if body and body.label else f"{v.label}-autofix")
+    src_fmt = v.format if v.format in ("srt", "vtt") else "srt"
     nv = Version(project_id=project_id, label=label, format=v.format,
-                 content=serialize(new_cues, v.format),
+                 content=serialize(new_cues, tb, src_fmt),
                  cues=[c.to_dict() for c in new_cues])
     db.add(nv)
     db.commit()
@@ -287,26 +466,53 @@ def autofix(project_id: int, version_id: int, body: AutoFixRequest | None = None
 @app.get("/projects/{project_id}/diff", response_model=DiffResponse)
 def diff(project_id: int, from_version: int = Query(...), to_version: int = Query(...),
          db: Session = Depends(get_db)):
-    _get_project(db, project_id)
+    p = _get_project(db, project_id)
+    tb = _project_tb(p)
     v1 = _get_version(db, project_id, from_version)
     v2 = _get_version(db, project_id, to_version)
-    result = diff_cues(_cues_of(v1), _cues_of(v2))
+    result = diff_cues(_cues_of(v1, tb), _cues_of(v2, tb), tb)
     return DiffResponse(project_id=project_id, from_version=from_version,
                         to_version=to_version, **result)
 
 
 # ---------------------------------------------------------------- 导出
 
+def _frame_export(p: Project, v: Version) -> FrameExport:
+    tb = _project_tb(p)
+    cues = _cues_of(v, tb)
+    out_cues: list[FrameCueOut] = []
+    for c in cues:
+        s_exact, e_exact = tb.frames_to_ms_exact(c.start_frame), tb.frames_to_ms_exact(c.end_frame)
+        out_cues.append(FrameCueOut(
+            index=c.index,
+            start_frame=c.start_frame, end_frame=c.end_frame,
+            duration_frames=c.duration_frames,
+            start_ms=tb.frames_to_ms(c.start_frame), end_ms=tb.frames_to_ms(c.end_frame),
+            duration_ms=c.duration_ms(tb),
+            start_ms_exact=f"{s_exact.numerator}/{s_exact.denominator}",
+            end_ms_exact=f"{e_exact.numerator}/{e_exact.denominator}",
+            start_tc=c.start_tc(tb), end_tc=c.end_tc(tb),
+            duration_tc_frames=c.duration_frames,
+            lines=c.lines, identifier=c.identifier, settings=c.settings))
+    return FrameExport(
+        project_id=p.id, version_id=v.id, label=v.label, format=v.format,
+        timebase=_tb_out(p), cue_count=len(cues),
+        shot_cuts=list(p.shot_cuts or []), cues=out_cues)
+
+
 @app.get("/projects/{project_id}/versions/{version_id}/export")
 def export(project_id: int, version_id: int,
-           format: str = Query(..., pattern="^(srt|vtt|report)$"),
+           format: str = Query(..., pattern="^(srt|vtt|report|frames)$"),
            db: Session = Depends(get_db)):
-    """导出修正后的 SRT / WebVTT 字幕或 JSON 质检报告。"""
+    """导出 SRT / WebVTT / JSON 质检报告 / 帧级 JSON。"""
     p = _get_project(db, project_id)
     v = _get_version(db, project_id, version_id)
+    tb = _project_tb(p)
     if format == "report":
         return _build_report(p, v)
-    text = serialize(_cues_of(v), format)
+    if format == "frames":
+        return _frame_export(p, v)
+    text = serialize(_cues_of(v, tb), tb, format)
     media_type = "application/x-subrip" if format == "srt" else "text/vtt"
     filename = f"project{project_id}-v{version_id}.{format}"
     return PlainTextResponse(

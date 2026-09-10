@@ -1,13 +1,17 @@
 """字幕质检：重叠、闪现、跨镜头、阅读速度超限、不自然断行等。
 
-每项问题都给出原因（message）与修正候选（fix_candidates）。
+所有时间类检查均在**帧域**进行：持续时间、间隔、切点容差通过有理数
+（``Fraction``）与项目时间基精确换算，不存在浮点舍入；阅读速度
+（CPS）同样用精确帧率计算。每项问题都给出原因（message）与
+修正候选（fix_candidates，候选时间同时给出帧号与 SMPTE 时间码）。
 """
 from __future__ import annotations
 
-import math
+from fractions import Fraction
 
-from .parsing import Cue, cue_visible_len, format_timestamp, visible_len, visible_text
+from .parsing import Cue, cue_visible_len, visible_len, visible_text
 from .schemas import FixCandidate, Issue, Rules
+from .timecode import Timebase, ceil_pos, format_smpte
 
 # 闭合类标点：不应出现在行首
 CLOSING_PUNCT = set("，。、！？；：…”’」』）】》,.!?;:%)]}»")
@@ -21,8 +25,18 @@ def _fc(action: str, description: str, **params) -> FixCandidate:
     return FixCandidate(action=action, description=description, params=params)
 
 
-def _ts(ms: int) -> str:
-    return format_timestamp(ms, "vtt")
+def _tc(frame: int, tb: Timebase) -> str:
+    return format_smpte(tb, frame)
+
+
+def _frame_param(action_frame: int, tb: Timebase) -> dict:
+    return {"frame": action_frame, "timecode": _tc(action_frame, tb),
+            "ms": tb.frames_to_ms(action_frame)}
+
+
+def _ms_to_frames_ceil(tb: Timebase, ms: int) -> int:
+    """毫秒保证量换算为帧数（向上取整，保证至少覆盖该毫秒时长）。"""
+    return ceil_pos(Fraction(ms) * tb.rate / 1000)
 
 
 # ---------------------------------------------------------------- 时间轴类检查
@@ -32,88 +46,113 @@ def check_cue_timing(
     next_cue: Cue | None,
     rules: Rules,
     shot_cuts: list[int],
+    tb: Timebase,
 ) -> list[Issue]:
     issues: list[Issue] = []
-    dur = cue.duration_ms
+    dur = cue.duration_frames
 
     if dur <= 0:
         issues.append(Issue(
             cue_index=cue.index, issue_type="invalid_timing", severity="error",
-            message="结束时间早于或等于开始时间",
-            details={"start_ms": cue.start_ms, "end_ms": cue.end_ms},
+            message="结束帧早于或等于开始帧",
+            details={"start_frame": cue.start_frame, "end_frame": cue.end_frame},
         ))
         return issues
 
-    if dur < rules.min_duration_ms:
-        target = cue.start_ms + rules.min_duration_ms
+    min_dur = _ms_to_frames_ceil(tb, rules.min_duration_ms)
+    max_dur = Fraction(rules.max_duration_ms) * tb.rate / 1000  # 上限：超出即违规，不收紧
+    min_gap = _ms_to_frames_ceil(tb, rules.min_gap_ms)
+
+    if dur < min_dur:
+        target = cue.start_frame + min_dur
         issues.append(Issue(
             cue_index=cue.index, issue_type="flash", severity="error",
-            message=f"显示时长 {dur}ms 低于最短显示时间 {rules.min_duration_ms}ms（闪现）",
-            details={"duration_ms": dur, "min_duration_ms": rules.min_duration_ms},
-            fix_candidates=[_fc("extend_end", f"结束时间延长到 {_ts(target)}", end_ms=target)],
+            message=(f"显示时长 {dur} 帧（约 {cue.duration_ms(tb)}ms）低于最短显示时间 "
+                     f"{rules.min_duration_ms}ms（{min_dur} 帧，闪现）"),
+            details={"duration_frames": dur, "min_duration_frames": min_dur,
+                     "min_duration_ms": rules.min_duration_ms},
+            fix_candidates=[_fc(
+                "extend_end", f"结束时间延长到 {_tc(target, tb)}（第 {target} 帧）",
+                **_frame_param(target, tb))],
         ))
 
-    if dur > rules.max_duration_ms:
-        target = cue.start_ms + rules.max_duration_ms
+    if Fraction(dur) > max_dur:
+        target = cue.start_frame + int(max_dur)  # 不超过上限的最后一个合法结束帧
         issues.append(Issue(
             cue_index=cue.index, issue_type="duration_too_long", severity="warning",
-            message=f"显示时长 {dur}ms 超过最长显示时间 {rules.max_duration_ms}ms",
-            details={"duration_ms": dur, "max_duration_ms": rules.max_duration_ms},
+            message=(f"显示时长 {dur} 帧（约 {cue.duration_ms(tb)}ms）超过最长显示时间 "
+                     f"{rules.max_duration_ms}ms"),
+            details={"duration_frames": dur, "max_duration_ms": rules.max_duration_ms},
             fix_candidates=[
                 _fc("split_cue", "按句子拆分为多条字幕"),
-                _fc("trim_end", f"结束时间提前到 {_ts(target)}", end_ms=target),
+                _fc("trim_end", f"结束时间提前到 {_tc(target, tb)}（第 {target} 帧）",
+                    **_frame_param(target, tb)),
             ],
         ))
 
     chars = cue_visible_len(cue)
     if chars > 0:
-        cps = chars / (dur / 1000.0)
-        if cps > rules.max_cps + 1e-6:
-            need = math.ceil(chars / rules.max_cps * 1000)
+        seconds = Fraction(dur) / tb.rate
+        cps = Fraction(chars) / seconds
+        if cps > Fraction(str(rules.max_cps)):
+            need = ceil_pos(Fraction(chars) / Fraction(str(rules.max_cps)) * tb.rate)
             issues.append(Issue(
                 cue_index=cue.index, issue_type="cps_exceeded", severity="error",
-                message=f"阅读速度 {cps:.1f} 字/秒，超过上限 {rules.max_cps} 字/秒",
-                details={"cps": round(cps, 2), "chars": chars, "duration_ms": dur},
+                message=(f"阅读速度 {float(cps):.2f} 字/秒（精确值），"
+                         f"超过上限 {rules.max_cps} 字/秒"),
+                details={"cps": round(float(cps), 3), "chars": chars,
+                         "duration_frames": dur},
                 fix_candidates=[
-                    _fc("extend_end", f"结束时间延长到 {_ts(cue.start_ms + need)}",
-                        end_ms=cue.start_ms + need),
+                    _fc("extend_end",
+                        f"结束时间延长到 {_tc(cue.start_frame + need, tb)}"
+                        f"（第 {cue.start_frame + need} 帧）",
+                        **_frame_param(cue.start_frame + need, tb)),
                     _fc("split_cue", "按句子拆分为多条字幕"),
                 ],
             ))
 
     if next_cue is not None:
-        gap = next_cue.start_ms - cue.end_ms
+        gap = next_cue.start_frame - cue.end_frame
         if gap < 0:
-            target = next_cue.start_ms - rules.min_gap_ms
+            target = next_cue.start_frame - min_gap
             issues.append(Issue(
                 cue_index=cue.index, issue_type="overlap", severity="error",
-                message=f"与第 {next_cue.index} 条字幕重叠 {-gap}ms",
-                details={"overlap_ms": -gap, "next_cue_index": next_cue.index},
+                message=f"与第 {next_cue.index} 条字幕重叠 {-gap} 帧",
+                details={"overlap_frames": -gap, "next_cue_index": next_cue.index},
                 fix_candidates=[
-                    _fc("trim_end", f"结束时间提前到 {_ts(target)}", end_ms=target),
+                    _fc("trim_end", f"结束时间提前到 {_tc(target, tb)}（第 {target} 帧）",
+                        **_frame_param(target, tb)),
                     _fc("shift_next", f"将第 {next_cue.index} 条整体后移"),
                 ],
             ))
-        elif gap < rules.min_gap_ms:
-            target = next_cue.start_ms - rules.min_gap_ms
+        elif gap < min_gap:
+            target = next_cue.start_frame - min_gap
             issues.append(Issue(
                 cue_index=cue.index, issue_type="gap_too_small", severity="warning",
-                message=f"与第 {next_cue.index} 条间隔 {gap}ms，小于最小间隔 {rules.min_gap_ms}ms",
-                details={"gap_ms": gap, "min_gap_ms": rules.min_gap_ms,
+                message=(f"与第 {next_cue.index} 条间隔 {gap} 帧，小于最小间隔 "
+                         f"{rules.min_gap_ms}ms（{min_gap} 帧）"),
+                details={"gap_frames": gap, "min_gap_frames": min_gap,
                          "next_cue_index": next_cue.index},
-                fix_candidates=[_fc("trim_end", f"结束时间提前到 {_ts(target)}", end_ms=target)],
+                fix_candidates=[_fc(
+                    "trim_end", f"结束时间提前到 {_tc(target, tb)}（第 {target} 帧）",
+                    **_frame_param(target, tb))],
             ))
 
-    tol = rules.shot_tolerance_ms
+    # 跨镜头：容差以毫秒给定时按精确帧边界比较（切点恰好落在容差边界不算跨）
+    tol_frames = Fraction(rules.shot_tolerance_ms) * tb.rate / 1000
     for cut in shot_cuts:
-        if cue.start_ms + tol < cut < cue.end_ms - tol:
+        if Fraction(cue.start_frame) + tol_frames < cut < Fraction(cue.end_frame) - tol_frames:
             issues.append(Issue(
                 cue_index=cue.index, issue_type="shot_cross", severity="error",
-                message=f"字幕跨越镜头切点 {_ts(cut)}",
-                details={"cut_ms": cut, "start_ms": cue.start_ms, "end_ms": cue.end_ms},
+                message=(f"字幕跨越镜头切点 {_tc(cut, tb)}（第 {cut} 帧）"),
+                details={"cut_frame": cut, "cut_ms": tb.frames_to_ms(cut),
+                         "start_frame": cue.start_frame, "end_frame": cue.end_frame},
                 fix_candidates=[
-                    _fc("trim_end", f"结束时间提前到切点 {_ts(cut)}", end_ms=cut),
-                    _fc("shift_after_cut", f"整条移到切点之后（开始于 {_ts(cut)}）", start_ms=cut),
+                    _fc("trim_end", f"结束时间提前到切点 {_tc(cut, tb)}",
+                        **_frame_param(cut, tb)),
+                    _fc("shift_after_cut",
+                        f"整条移到切点之后（开始于 {_tc(cut, tb)}）",
+                        **_frame_param(cut, tb)),
                 ],
             ))
     return issues
@@ -193,13 +232,16 @@ def run_qc(
     cues: list[Cue],
     rules: Rules,
     shot_cuts: list[int] | None = None,
-    frame_rate: float | None = None,
+    tb: Timebase | None = None,
 ) -> list[Issue]:
     cuts = sorted(shot_cuts or [])
+    if tb is None:  # 防御性缺省：25fps
+        from .timecode import build_timebase
+        tb = build_timebase(25)
     issues: list[Issue] = []
     for i, cue in enumerate(cues):
         nxt = cues[i + 1] if i + 1 < len(cues) else None
-        issues.extend(check_cue_timing(cue, nxt, rules, cuts))
+        issues.extend(check_cue_timing(cue, nxt, rules, cuts, tb))
         issues.extend(check_cue_text(cue, rules))
     issues.sort(key=lambda x: (x.cue_index, x.issue_type))
     return issues

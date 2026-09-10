@@ -106,7 +106,9 @@ def test_project_with_template():
     })
     assert r.status_code == 201, r.text
     body = r.json()
-    assert body["shot_cuts"] == [6000, 12500]
+    # 24fps 下切点换算为帧：6000ms→144 帧，12500ms→300 帧
+    assert body["shot_cuts"] == [144, 300]
+    assert body["shot_cuts_ms"] == [6000, 12500]
     assert body["rules"]["max_chars_per_line"] == 16
 
     # 不存在的模板
@@ -179,9 +181,12 @@ def test_autofix_creates_fixed_version():
     new_vid = body["new_version_id"]
     assert new_vid != vid
 
-    # 原稿未被覆盖
+    # 原稿未被覆盖（真值为帧号：1000ms/300ms @25fps → 25 帧 / 8 帧）
     orig = client.get(f"/projects/{pid}/versions/{vid}").json()
-    assert orig["cues"][0]["end_ms"] == 1300
+    assert orig["cues"][0]["start_frame"] == 25
+    assert orig["cues"][0]["end_frame"] == 33
+    assert orig["cues"][0]["start_ms"] == 1000
+    assert orig["cues"][0]["end_ms"] == 1320  # 8 帧 @25fps = 320ms
 
     # 新版本全部通过质检（无 error 级问题）
     report = client.post(f"/projects/{pid}/versions/{new_vid}/qc").json()
@@ -197,8 +202,8 @@ def test_autofix_creates_fixed_version():
 
 
 def test_autofix_conflict_keeps_original():
-    # 偏移上限极小 + 间隔不足 → 闪现无法修复 → 冲突且保留原稿
-    rules = {**RULES, "max_offset_ms": 50}
+    # 偏移上限极小 + 间隔不足 → 闪现无法修复 → 冲突且保留原稿（帧号真值不变）
+    rules = {**RULES, "max_offset_ms": 50, "min_gap_ms": 0}
     srt = """1
 00:00:01,000 --> 00:00:01,300
 太短
@@ -215,10 +220,10 @@ def test_autofix_conflict_keeps_original():
     assert len(body["conflicts"]) == 1
     assert body["conflicts"][0]["cue_index"] == 1
     assert body["conflicts"][0]["reasons"]
-    # 冲突字幕在新版本中保持原稿
+    # 冲突字幕在新版本中保持原稿（帧号不变）
     fixed = client.get(f"/projects/{pid}/versions/{body['new_version_id']}").json()
-    assert fixed["cues"][0]["start_ms"] == 1000
-    assert fixed["cues"][0]["end_ms"] == 1300
+    assert fixed["cues"][0]["start_frame"] == 25
+    assert fixed["cues"][0]["end_frame"] == 33
 
 
 def test_autofix_splits_long_cue():
