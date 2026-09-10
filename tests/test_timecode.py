@@ -345,3 +345,53 @@ def test_legacy_frame_rate_requests_still_work():
     r = client.get(f"/projects/{pid}/versions/{vid}/export",
                    params={"format": "report"})
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------- 零点重叠边界（回归）
+
+def test_qc_overlap_at_zero_returns_report_with_legal_candidates():
+    """后一条 cue 从第 1 帧开始、与前一条重叠时，trim_end 候选不得为负帧。
+
+    25fps 默认 min_gap_ms=100（=3 帧）：next.start=1 → target=1-3=-2，
+    必须钳制到最早合法帧 0，/qc 返回 200 的 overlap 报告。
+    """
+    pid = client.post("/projects", json={"name": "zero", "frame_rate": 25.0}).json()["id"]
+    # cue1 0..10 帧（00:00:00,000 --> 00:00:00,400），cue2 从第 1 帧（40ms）开始
+    srt = ("1\n00:00:00,000 --> 00:00:00,400\n第一句字幕内容\n\n"
+           "2\n00:00:00,040 --> 00:00:02,000\n第二句字幕内容\n")
+    vid = client.post(f"/projects/{pid}/versions", json={"content": srt}).json()["id"]
+
+    r = client.post(f"/projects/{pid}/versions/{vid}/qc")
+    assert r.status_code == 200, r.text
+    report = r.json()
+
+    overlaps = [i for i in report["issues"] if i["issue_type"] == "overlap"]
+    assert len(overlaps) == 1
+    assert overlaps[0]["severity"] == "error"
+    assert overlaps[0]["details"]["overlap_frames"] == 9
+
+    # 所有修正候选都只能落在合法帧（>= 0），且帧号/时间码/毫秒自洽
+    for issue in report["issues"]:
+        for fc in issue["fix_candidates"]:
+            if "frame" in fc["params"]:
+                frame = fc["params"]["frame"]
+                assert frame >= 0
+                conv = client.post(
+                    f"/projects/{pid}/convert",
+                    json={"items": [fc["params"]["timecode"]]}).json()
+                assert conv[0]["frame"] == frame
+
+    # 原负帧候选被钳制到第 0 帧
+    trim = next(fc for fc in overlaps[0]["fix_candidates"] if fc["action"] == "trim_end")
+    assert trim["params"]["frame"] == 0
+    assert trim["params"]["timecode"] == "00:00:00:00"
+    assert trim["params"]["ms"] == 0
+
+
+def test_qc_legal_candidate_frame_helper():
+    """_legal_frame 单元覆盖：不改变正帧，仅钳制负帧到 0。"""
+    from app.qc import _legal_frame
+    assert _legal_frame(-2) == 0
+    assert _legal_frame(-1) == 0
+    assert _legal_frame(0) == 0
+    assert _legal_frame(5) == 5

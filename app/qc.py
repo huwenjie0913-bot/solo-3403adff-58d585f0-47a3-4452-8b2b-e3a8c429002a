@@ -34,6 +34,11 @@ def _frame_param(action_frame: int, tb: Timebase) -> dict:
             "ms": tb.frames_to_ms(action_frame)}
 
 
+def _legal_frame(frame: int) -> int:
+    """候选动作帧钳制到合法范围：时间线最早为第 0 帧（不产生负帧）。"""
+    return max(0, frame)
+
+
 def _ms_to_frames_ceil(tb: Timebase, ms: int) -> int:
     """毫秒保证量换算为帧数（向上取整，保证至少覆盖该毫秒时长）。"""
     return ceil_pos(Fraction(ms) * tb.rate / 1000)
@@ -114,7 +119,7 @@ def check_cue_timing(
     if next_cue is not None:
         gap = next_cue.start_frame - cue.end_frame
         if gap < 0:
-            target = next_cue.start_frame - min_gap
+            target = _legal_frame(next_cue.start_frame - min_gap)
             issues.append(Issue(
                 cue_index=cue.index, issue_type="overlap", severity="error",
                 message=f"与第 {next_cue.index} 条字幕重叠 {-gap} 帧",
@@ -126,7 +131,7 @@ def check_cue_timing(
                 ],
             ))
         elif gap < min_gap:
-            target = next_cue.start_frame - min_gap
+            target = _legal_frame(next_cue.start_frame - min_gap)
             issues.append(Issue(
                 cue_index=cue.index, issue_type="gap_too_small", severity="warning",
                 message=(f"与第 {next_cue.index} 条间隔 {gap} 帧，小于最小间隔 "
