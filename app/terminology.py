@@ -35,6 +35,14 @@ from .timecode import Timebase, format_smpte
 
 CONTEXT_RADIUS = 15  # 上下文片段在命中处前后各取的字符数
 
+# 替换文本若含换行或标签标记，写入派生字幕就会改变其结构——一律禁止
+_STRUCT_RE = re.compile(r"[\r\n]|<[^>]+>|\{[^}]*\}")
+
+
+def replacement_is_safe(text: str) -> bool:
+    """替换文本必须是单行纯文本（不含换行/标签），否则拒绝生成/应用候选。"""
+    return _STRUCT_RE.search(text) is None
+
 
 # ---------------------------------------------------------------- 匹配
 
@@ -162,6 +170,10 @@ def _scan_target(rule: TerminologyRuleOut, cues: list[Cue]) -> list[_Hit]:
 _TAG_RE = re.compile(r"<[^>]+>|\{[^}]*\}")
 
 
+def _tag_count(text: str) -> int:
+    return len(_TAG_RE.findall(text))
+
+
 def _raw_span(line: str, start: int, end: int) -> tuple[int, int] | None:
     """把去标签文本上的 (start, end) 映射到原始行；区间内含标签则不可替换。"""
     mapping: list[int] = []
@@ -218,11 +230,18 @@ class _Run:
         line = self.lines.get((hit.frag.cue_index, hit.frag.line_index))
         if line is None:
             return None
+        # 防护：替换文本含换行/标签会改变字幕结构（正常情况下已在校验层拒绝）
+        if not replacement_is_safe(replacement):
+            return None
         span = _raw_span(line, hit.frag.start, hit.frag.end)
         if span is None:
             return None
         a, b = span
         found = line[a:b]
+        preview_line = line[:a] + replacement + line[b:]
+        # 防护：替换不得新增/删除标签（换行已由 replacement_is_safe 保证）
+        if _tag_count(preview_line) != _tag_count(line):
+            return None
         return TermFixCandidate(
             id=self.next_cid(mapping_id, rule.id),
             action="replace_term",
@@ -502,6 +521,31 @@ class TermCandidateStaleError(ValueError):
             f"候选 {cid} 已失效：期望片段 {expected!r}，原文为 {actual!r}")
 
 
+class TermCandidateUnsafeError(ValueError):
+    """候选替换会改变字幕结构（换行/标签），拒绝应用。"""
+
+    def __init__(self, cid: str, reason: str):
+        self.cid = cid
+        super().__init__(f"候选 {cid} 不安全：{reason}")
+
+
+def _guard_candidate(cand: TermFixCandidate, before: str) -> None:
+    """应用前防护：替换必须保持单行、标签集合与时间码（时间码不在行内）不变。"""
+    if not replacement_is_safe(cand.replacement):
+        raise TermCandidateUnsafeError(
+            cand.id, "替换文本含换行或标签标记，会改变字幕结构")
+    if cand.start < 0 or cand.end > len(before) or cand.end <= cand.start:
+        raise TermCandidateUnsafeError(cand.id, "替换区间越界")
+    after = before[cand.start:cand.end]
+    if after != cand.found:
+        raise TermCandidateStaleError(cand.id, cand.found, after)
+    new_line = before[:cand.start] + cand.replacement + before[cand.end:]
+    if "\n" in new_line or "\r" in new_line:
+        raise TermCandidateUnsafeError(cand.id, "替换会在行内产生换行")
+    if _tag_count(new_line) != _tag_count(before):
+        raise TermCandidateUnsafeError(cand.id, "替换会新增或删除标签")
+
+
 def index_candidates(report: TerminologyReport) -> dict[str, TermFixCandidate]:
     return {c.id: c for i in report.issues for c in i.fix_candidates}
 
@@ -525,9 +569,7 @@ def preview_terminology(report: TerminologyReport, tgt_cues: list[Cue],
     items: list[dict] = []
     for cand in _select(report, candidate_ids):
         before = lines_by[(cand.cue_index, cand.line_index)]
-        if before[cand.start:cand.end] != cand.found:
-            raise TermCandidateStaleError(
-                cand.id, cand.found, before[cand.start:cand.end])
+        _guard_candidate(cand, before)
         items.append({
             "candidate_id": cand.id, "cue_index": cand.cue_index,
             "line_index": cand.line_index,
@@ -563,9 +605,7 @@ def apply_terminology(report: TerminologyReport, tgt_cues: list[Cue],
     for (cue_ix, li), cands in by_line.items():
         line = lines_by[cue_ix][li]
         for cand in sorted(cands, key=lambda c: c.start, reverse=True):
-            if line[cand.start:cand.end] != cand.found:
-                raise TermCandidateStaleError(
-                    cand.id, cand.found, line[cand.start:cand.end])
+            _guard_candidate(cand, line)
             line = line[:cand.start] + cand.replacement + line[cand.end:]
             applied.append({
                 "candidate_id": cand.id, "cue_index": cue_ix,

@@ -495,3 +495,220 @@ def test_apply_then_qc_diff_export():
     remaining = {i["issue_type"] for i in rep["issues"]}
     assert "term_forbidden_variant" not in remaining
     assert "term_case_error" not in remaining
+
+
+# ---------------------------------------------------------------- 结构安全回归（换行/标签注入）
+
+def test_create_rejects_newline_or_tag_in_translation_fields():
+    pid = _project()
+    base = {"source_term": "校对", "preferred_translation": "proofread"}
+
+    # preferred_translation 含换行（\n 与 \r\n）
+    r = client.post(f"/projects/{pid}/terminology",
+                    json={**base, "preferred_translation": "fix\nnow"})
+    assert r.status_code == 422
+    assert "换行" in str(r.json())
+
+    r = client.post(f"/projects/{pid}/terminology",
+                    json={**base, "preferred_translation": "fix\r\nnow"})
+    assert r.status_code == 422 and "换行" in str(r.json())
+
+    # preferred_translation 含标签
+    r = client.post(f"/projects/{pid}/terminology",
+                    json={**base, "preferred_translation": "<i>proofread</i>"})
+    assert r.status_code == 422
+    assert "标签" in str(r.json())
+
+    # 可接受/禁用变体含换行或标签同样拒绝
+    r = client.post(f"/projects/{pid}/terminology",
+                    json={**base, "acceptable_variants": ["fix\nnow"]})
+    assert r.status_code == 422 and "换行" in str(r.json())
+    r = client.post(f"/projects/{pid}/terminology",
+                    json={**base, "forbidden_variants": ["<b>x</b>"]})
+    assert r.status_code == 422 and "标签" in str(r.json())
+    r = client.post(f"/projects/{pid}/terminology",
+                    json={**base, "forbidden_variants": ["{\\an8}"]})
+    assert r.status_code == 422 and "标签" in str(r.json())
+
+    # source_term 含换行/标签也拒绝（源侧匹配同样基于纯文本）
+    r = client.post(f"/projects/{pid}/terminology",
+                    json={"source_term": "校\n对", "preferred_translation": "x"})
+    assert r.status_code == 422
+
+
+def test_update_rejects_newline_or_tag():
+    pid = _project()
+    rid = _add_rule(pid, source_term="校对",
+                    preferred_translation="proofread")["id"]
+    r = client.put(f"/projects/{pid}/terminology/{rid}",
+                   json={"preferred_translation": "fix\nnow"})
+    assert r.status_code == 422 and "换行" in str(r.json())
+    r = client.put(f"/projects/{pid}/terminology/{rid}",
+                   json={"acceptable_variants": ["<i>x</i>"]})
+    assert r.status_code == 422 and "标签" in str(r.json())
+    # 拒绝后原值保持不变
+    cur = client.get(f"/projects/{pid}/terminology/{rid}").json()
+    assert cur["preferred_translation"] == "proofread"
+    assert cur["acceptable_variants"] == []
+
+
+def test_candidate_generation_guard_drops_structural_replacement():
+    """引擎层防护：替换文本含换行/标签时不生成候选（防御绕过校验层的旧数据）。"""
+    from app.schemas import TerminologyRuleOut
+    from app.terminology import run_terminology
+    from app.align import AlignOptions
+    from app.timecode import build_timebase
+    from app.parsing import Cue, parse_subtitles
+
+    tb = build_timebase(25.0)
+    src_cues, _ = parse_subtitles(
+        "1\n00:00:01,000 --> 00:00:03,000\n校对完成\n", tb, "srt")
+    tgt_cues, _ = parse_subtitles(
+        "1\n00:00:01,000 --> 00:00:03,000\ncheck done\n", tb, "srt")
+
+    # 直接构造规则快照（绕过 API 校验）：首选译法含换行
+    rule = TerminologyRuleOut(
+        id=1, project_id=1, source_term="校对",
+        preferred_translation="fix\nnow", acceptable_variants=[],
+        forbidden_variants=["check"], case_sensitive=False, whole_word=True,
+        severity="error", note=None,
+        created_at="2026-01-01T00:00:00Z", updated_at="2026-01-01T00:00:00Z")
+    opts = AlignOptions.from_ms(200, 0.3, True, "source_boundaries", tb)
+    from app.schemas import TimebaseOut
+    tbo = TimebaseOut(fps=25.0, fps_label="25", rate_num=25, rate_den=1,
+                      drop_frame=False, start_timecode="00:00:00:00")
+    report, _ = run_terminology(
+        src_cues, tgt_cues, [rule], opts, tb, project_id=1,
+        source_version_id=1, target_version_id=2,
+        timebase_out=tbo, min_overlap_ms=200)
+    issue = report.issues[0]
+    assert issue.issue_type == "term_forbidden_variant"
+    # 首选译法 "fix\nnow" 含换行 → 不出候选，避免结构被改写
+    assert issue.fix_candidates == []
+
+    # 首选译法含标签同理
+    rule2 = rule.model_copy(update={"id": 2,
+                                    "preferred_translation": "<i>proofread</i>"})
+    report2, _ = run_terminology(
+        src_cues, tgt_cues, [rule2], opts, tb, project_id=1,
+        source_version_id=1, target_version_id=2,
+        timebase_out=tbo, min_overlap_ms=200)
+    assert report2.issues[0].fix_candidates == []
+
+
+def test_apply_rejects_structural_candidate_via_engine_guard():
+    """API 端到端：校验层保证正常术语可用；含结构的首选译法无法创建，
+    且即便存在也不会产生候选，应用不改变 cue 结构。"""
+    pid, sid, tid = _setup()
+    ids = _default_rules(pid)
+    # 正常普通替换仍可用（对照）
+    rep = _check(pid, sid, tid)
+    assert rep["summary"]["fixable_candidate_count"] >= 1
+    # 尝试通过 API 创建含结构的术语必须失败
+    r = client.post(f"/projects/{pid}/terminology",
+                    json={"source_term": "校对", "preferred_translation": "fix\nnow"})
+    assert r.status_code == 422
+    r = client.post(f"/projects/{pid}/terminology",
+                    json={"source_term": "校对",
+                          "preferred_translation": "<i>proofread</i>"})
+    assert r.status_code == 422
+
+
+def test_normal_replacement_preserves_structure_and_downstream():
+    """普通单行纯文本替换：时间码/标签/换行不变，质检/比较/导出链路正常。"""
+    pid, sid, tid = _setup()
+    _default_rules(pid)
+
+    before = client.get(f"/projects/{pid}/versions/{tid}").json()["cues"]
+    before_struct = [(c["start_frame"], c["end_frame"], len(c["lines"]),
+                      tuple(c["lines"])) for c in before]
+
+    nid = client.post(f"/projects/{pid}/terminology/apply",
+                      json={"source_version_id": sid,
+                            "target_version_id": tid}).json()["new_version_id"]
+    after = client.get(f"/projects/{pid}/versions/{nid}").json()["cues"]
+
+    # 时间码与行数完全一致；只有文本变化，无新增换行/标签
+    assert [(c["start_frame"], c["end_frame"], len(c["lines"]))
+            for c in after] == [(s, e, n) for s, e, n, _ in before_struct]
+    for c in after:
+        for ln in c["lines"]:
+            assert "\n" not in ln and "\r" not in ln
+
+    # 原稿未改动
+    orig = client.get(f"/projects/{pid}/versions/{tid}").json()["cues"]
+    assert [tuple(c["lines"]) for c in orig] == [lines for *_, lines in before_struct]
+
+    # 质检 / 比较 / SRT / VTT / 帧级导出链路正常
+    assert client.post(f"/projects/{pid}/versions/{nid}/qc").status_code == 200
+    assert client.get(f"/projects/{pid}/diff",
+                      params={"from_version": tid, "to_version": nid}
+                      ).json()["summary"]["changed"] >= 1
+    srt = client.get(f"/projects/{pid}/versions/{nid}/export",
+                     params={"format": "srt"}).text
+    vtt = client.get(f"/projects/{pid}/versions/{nid}/export",
+                     params={"format": "vtt"}).text
+    frames = client.get(f"/projects/{pid}/versions/{nid}/export",
+                        params={"format": "frames"}).json()
+    # 替换后 cue 块时间码与原 cue 一一对应（以 cue1 为例）
+    assert "00:00:01,000 --> 00:00:03,000" in srt
+    assert vtt.startswith("WEBVTT")
+    assert frames["cues"][0]["start_frame"] == before[0]["start_frame"]
+
+
+def test_preview_and_apply_guard_reject_structural_candidate():
+    """直接构造含换行/标签的候选（绕过生成环节），预览/应用必须拒绝。"""
+    import pytest
+    from app.schemas import TermFixCandidate
+    from app.terminology import (
+        TermCandidateUnsafeError, apply_terminology, preview_terminology)
+
+    pid = _project()
+    sid = _upload(pid, "1\n00:00:01,000 --> 00:00:03,000\n出发\n", "s")
+    tid = _upload(pid, "1\n00:00:01,000 --> 00:00:03,000\nwe leave\n", "t")
+    rep_json = _check(pid, sid, tid)
+    assert rep_json["issues"] == []  # 无术语，报告为空
+
+    # 手工伪造报告与含结构的候选
+    from app.schemas import TermIssue, TerminologyReport, TerminologyRuleOut
+    rule = TerminologyRuleOut(
+        id=9, project_id=pid, source_term="出发", preferred_translation="depart",
+        acceptable_variants=[], forbidden_variants=[], case_sensitive=False,
+        whole_word=True, severity="error", note=None,
+        created_at="2026-01-01T00:00:00Z", updated_at="2026-01-01T00:00:00Z")
+    from app.parsing import Cue
+    tgt_cues = [Cue(1, 25, 75, ["we leave"])]
+
+    def forged(replacement):
+        return TermFixCandidate(
+            id="t1.r9.c1", action="replace_term", description="x",
+            cue_index=1, line_index=0, start=3, end=8, found="leave",
+            replacement=replacement,
+            preview_line="we " + replacement)
+
+    def report_with(cand):
+        issue = TermIssue(
+            issue_type="term_forbidden_variant", severity="error",
+            message="x", rule=rule, mapping_id=1,
+            source_cues=[], target_cues=[], fix_candidates=[cand])
+        return TerminologyReport.model_validate(
+            {**rep_json, "issues": [issue.model_dump(mode="json")]})
+
+    # 引擎层：换行替换
+    rpt = report_with(forged("go\nnow"))
+    with pytest.raises(TermCandidateUnsafeError):
+        preview_terminology(rpt, tgt_cues, ["t1.r9.c1"])
+    with pytest.raises(TermCandidateUnsafeError):
+        apply_terminology(rpt, tgt_cues, ["t1.r9.c1"])
+    # 引擎层：标签替换
+    rpt = report_with(forged("<i>go</i>"))
+    with pytest.raises(TermCandidateUnsafeError):
+        preview_terminology(rpt, tgt_cues, ["t1.r9.c1"])
+    with pytest.raises(TermCandidateUnsafeError):
+        apply_terminology(rpt, tgt_cues, ["t1.r9.c1"])
+    # 安全的普通替换正常应用，且不改变结构
+    rpt = report_with(forged("depart"))
+    new_cues, applied = apply_terminology(rpt, tgt_cues, ["t1.r9.c1"])
+    assert new_cues[0].lines == ["we depart"]
+    assert (new_cues[0].start_frame, new_cues[0].end_frame) == (25, 75)
+    assert len(applied) == 1

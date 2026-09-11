@@ -1,10 +1,30 @@
 """Pydantic 请求/响应模型。"""
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+# 标签/ASS 覆盖标记：术语译法若包含这类内容，替换时会向字幕注入标签或换行
+_TERM_STRUCT_RE = re.compile(r"<[^>]+>|\{[^}]*\}")
+
+
+def _reject_structural_text(label: str, value: str) -> None:
+    """术语文本只能是单行纯文本：含换行或标签会改变字幕结构，拒绝。"""
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"{label}不能包含换行符（替换会改变字幕原有换行结构）")
+    if _TERM_STRUCT_RE.search(value):
+        raise ValueError(
+            f"{label}不能包含标签标记（如 <i>…</i>、{{\\an8}}），"
+            f"替换会向字幕注入标签")
+
+
+def _reject_structural_variants(label: str, variants: list[str]) -> None:
+    for i, v in enumerate(variants):
+        _reject_structural_text(f"{label}[{i}]（{v!r}）", v)
 
 
 # ---------------------------------------------------------------- 规则
@@ -450,6 +470,11 @@ class TerminologyRuleCreate(BaseModel):
             raise ValueError("source_term 不能为空")
         if not self.preferred_translation:
             raise ValueError("preferred_translation 不能为空")
+        # 术语文本为单行纯文本：含换行/标签会让替换改变字幕结构
+        _reject_structural_text("source_term", self.source_term)
+        _reject_structural_text("preferred_translation", self.preferred_translation)
+        _reject_structural_variants("acceptable_variants", self.acceptable_variants)
+        _reject_structural_variants("forbidden_variants", self.forbidden_variants)
         overlap = sorted(set(self.forbidden_variants)
                          & (set(self.acceptable_variants) | {self.preferred_translation}))
         if overlap:
@@ -475,14 +500,21 @@ class TerminologyRuleUpdate(BaseModel):
             self.source_term = self.source_term.strip()
             if not self.source_term:
                 raise ValueError("source_term 不能为空")
+            _reject_structural_text("source_term", self.source_term)
         if self.preferred_translation is not None:
             self.preferred_translation = self.preferred_translation.strip()
             if not self.preferred_translation:
                 raise ValueError("preferred_translation 不能为空")
+            _reject_structural_text(
+                "preferred_translation", self.preferred_translation)
         if self.acceptable_variants is not None:
             self.acceptable_variants = _clean_variants(self.acceptable_variants)
+            _reject_structural_variants(
+                "acceptable_variants", self.acceptable_variants)
         if self.forbidden_variants is not None:
             self.forbidden_variants = _clean_variants(self.forbidden_variants)
+            _reject_structural_variants(
+                "forbidden_variants", self.forbidden_variants)
         return self
 
 

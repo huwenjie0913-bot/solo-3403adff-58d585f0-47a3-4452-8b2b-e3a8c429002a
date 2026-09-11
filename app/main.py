@@ -78,6 +78,7 @@ from .timecode import (
 from .terminology import (
     TermCandidateConflictError,
     TermCandidateStaleError,
+    TermCandidateUnsafeError,
     UnknownTermCandidateError,
     apply_terminology,
     preview_terminology,
@@ -780,6 +781,8 @@ def terminology_preview(project_id: int, body: TerminologyPreviewRequest,
         raise HTTPException(400, str(e))
     except TermCandidateStaleError as e:
         raise HTTPException(409, str(e))
+    except TermCandidateUnsafeError as e:
+        raise HTTPException(400, str(e))
     return TerminologyPreviewResponse(items=items)
 
 
@@ -803,6 +806,8 @@ def terminology_apply(project_id: int, body: TerminologyApplyRequest,
     except UnknownTermCandidateError as e:
         raise HTTPException(400, str(e))
     except TermCandidateConflictError as e:
+        raise HTTPException(400, str(e))
+    except TermCandidateUnsafeError as e:
         raise HTTPException(400, str(e))
     except TermCandidateStaleError as e:
         raise HTTPException(409, str(e))
