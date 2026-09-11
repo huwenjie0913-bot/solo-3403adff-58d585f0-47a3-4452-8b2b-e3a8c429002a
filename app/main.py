@@ -15,6 +15,16 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy.orm import Session
 
+from .align import (
+    AlignOptions,
+    CandidateConflictError,
+    UnknownCandidateError,
+    apply_alignment,
+    mapping_out,
+    run_alignment,
+    summarize_alignment,
+    unmatched_out,
+)
 from .autofix import auto_fix
 from .database import get_db, init_db
 from .diffing import diff_cues
@@ -22,6 +32,11 @@ from .models import Project, RuleTemplate, Version
 from .parsing import Cue, parse_shot_cuts, parse_subtitles, serialize
 from .qc import run_qc, summarize
 from .schemas import (
+    AlignApplyRequest,
+    AlignApplyResponse,
+    AlignReport,
+    AlignRequest,
+    AlignThresholds,
     AutoFixRequest,
     AutoFixResponse,
     ConvertedPosition,
@@ -152,7 +167,8 @@ def _project_out(p: Project) -> ProjectOut:
 def _version_out(v: Version) -> VersionOut:
     return VersionOut(
         id=v.id, project_id=v.project_id, label=v.label, format=v.format,
-        cue_count=len(v.cues), created_at=v.created_at,
+        cue_count=len(v.cues), origin_version_id=v.origin_version_id,
+        provenance=v.provenance, created_at=v.created_at,
     )
 
 
@@ -230,6 +246,7 @@ def root():
             "/projects/{id}/versions/{vid}/qc",
             "/projects/{id}/versions/{vid}/autofix",
             "/projects/{id}/versions/{vid}/export", "/projects/{id}/diff",
+            "/projects/{id}/align", "/projects/{id}/align/apply",
             "/projects/{id}/convert", "/timecode/convert",
         ],
     }
@@ -446,7 +463,9 @@ def autofix(project_id: int, version_id: int, body: AutoFixRequest | None = None
     src_fmt = v.format if v.format in ("srt", "vtt") else "srt"
     nv = Version(project_id=project_id, label=label, format=v.format,
                  content=serialize(new_cues, tb, src_fmt),
-                 cues=[c.to_dict() for c in new_cues])
+                 cues=[c.to_dict() for c in new_cues],
+                 origin_version_id=v.id,
+                 provenance={"kind": "autofix"})
     db.add(nv)
     db.commit()
     db.refresh(nv)
@@ -459,6 +478,116 @@ def autofix(project_id: int, version_id: int, body: AutoFixRequest | None = None
             "conflict_cues": len(conflicts),
         },
     )
+
+
+# ---------------------------------------------------------------- 双语对齐
+
+def _align_versions(db: Session, project_id: int,
+                    source_id: int, target_id: int) -> tuple[Version, Version]:
+    if source_id == target_id:
+        raise HTTPException(400, "源语言版本与译文版本不能相同")
+    return (_get_version(db, project_id, source_id),
+            _get_version(db, project_id, target_id))
+
+
+def _align_options(body, tb: Timebase) -> AlignOptions:
+    return AlignOptions.from_ms(body.min_overlap_ms, body.min_overlap_ratio,
+                                body.speaker_check, body.candidate_strategy, tb)
+
+
+def _thresholds_out(body, opts: AlignOptions) -> AlignThresholds:
+    return AlignThresholds(
+        min_overlap_ms=body.min_overlap_ms,
+        min_overlap_frames=opts.min_overlap_frames,
+        min_overlap_ratio=body.min_overlap_ratio,
+        speaker_check=body.speaker_check,
+        candidate_strategy=body.candidate_strategy)
+
+
+@app.post("/projects/{project_id}/align", response_model=AlignReport)
+def align(project_id: int, body: AlignRequest, db: Session = Depends(get_db)):
+    """把两个版本指定为源语言与译文，生成 cue 映射、同步诊断与修复候选。
+
+    按时间区间重叠及相邻顺序生成一对一/一对多/多对一映射；对未匹配 cue、
+    重叠不足、译文漏条、顺序倒置和说话人标签不一致返回字段化诊断；修复
+    候选以源 cue 边界为依据（拆分/合并/时间调整），不改写文本。
+    """
+    p = _get_project(db, project_id)
+    sv, tv = _align_versions(db, project_id,
+                             body.source_version_id, body.target_version_id)
+    tb = _project_tb(p)
+    opts = _align_options(body, tb)
+    result = run_alignment(_cues_of(sv, tb), _cues_of(tv, tb), opts, tb)
+    return AlignReport(
+        project_id=project_id, source_version_id=sv.id, target_version_id=tv.id,
+        generated_at=datetime.now(timezone.utc), timebase=_tb_out(p),
+        thresholds=_thresholds_out(body, opts),
+        summary=summarize_alignment(result),
+        mappings=[mapping_out(m, tb) for m in result.mappings],
+        unmatched_source=[unmatched_out(c, "source", tb)
+                          for c in result.unmatched_source],
+        unmatched_target=[unmatched_out(c, "target", tb)
+                          for c in result.unmatched_target],
+    )
+
+
+@app.post("/projects/{project_id}/align/apply",
+          response_model=AlignApplyResponse, status_code=201)
+def align_apply(project_id: int, body: AlignApplyRequest,
+                db: Session = Depends(get_db)):
+    """把选定候选应用到译文版本，保存为关联原版本的新字幕版本（原稿保留）。
+
+    阈值参数需与生成候选时的 /align 请求一致（候选 id 按同一阈值重算）。
+    新版本可继续使用质检、差异比较与 SRT/WebVTT/帧级导出。
+    """
+    p = _get_project(db, project_id)
+    sv, tv = _align_versions(db, project_id,
+                             body.source_version_id, body.target_version_id)
+    tb = _project_tb(p)
+    opts = _align_options(body, tb)
+    src_cues = _cues_of(sv, tb)
+    tgt_cues = _cues_of(tv, tb)
+    result = run_alignment(src_cues, tgt_cues, opts, tb)
+    selected = body.candidate_ids
+    if selected is None:  # 缺省应用全部候选
+        selected = [c.id for m in result.mappings for c in m.candidates]
+    try:
+        new_cues, applied = apply_alignment(result.mappings, selected,
+                                            tgt_cues, tb)
+    except UnknownCandidateError as e:
+        raise HTTPException(400, f"未知候选 id: {', '.join(e.ids)}")
+    except CandidateConflictError as e:
+        raise HTTPException(400, str(e))
+    label = body.label or f"{tv.label}-aligned"
+    src_fmt = tv.format if tv.format in ("srt", "vtt") else "srt"
+    nv = Version(
+        project_id=project_id, label=label, format=tv.format,
+        content=serialize(new_cues, tb, src_fmt),
+        cues=[c.to_dict() for c in new_cues],
+        origin_version_id=tv.id,
+        provenance={
+            "kind": "align",
+            "source_version_id": sv.id,
+            "target_version_id": tv.id,
+            "options": {
+                "min_overlap_ms": body.min_overlap_ms,
+                "min_overlap_ratio": body.min_overlap_ratio,
+                "speaker_check": body.speaker_check,
+                "candidate_strategy": body.candidate_strategy,
+            },
+            "applied_candidate_ids": [a["candidate_id"] for a in applied],
+        })
+    db.add(nv)
+    db.commit()
+    db.refresh(nv)
+    return AlignApplyResponse(
+        new_version_id=nv.id, label=label, origin_version_id=tv.id,
+        applied=applied,
+        summary={
+            "cue_count_before": len(tgt_cues),
+            "cue_count_after": len(new_cues),
+            "applied_count": len(applied),
+        })
 
 
 # ---------------------------------------------------------------- 版本比较

@@ -56,6 +56,10 @@ class Version(Base):
     format: Mapped[str] = mapped_column(String(20))  # srt / vtt / json
     content: Mapped[str] = mapped_column(Text)       # 字幕全文（原稿或修复稿）
     cues: Mapped[list] = mapped_column(JSON)         # 解析后的 cue 快照（帧号）
+    origin_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("versions.id"), nullable=True)    # 派生来源版本（自动修复/对齐）
+    provenance: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True)                         # 派生信息（来源类型、参数等）
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
 
     project: Mapped[Project] = relationship(back_populates="versions")

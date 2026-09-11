@@ -32,6 +32,10 @@ _ADDED_COLUMNS = {
         ("drop_frame", "BOOLEAN NOT NULL DEFAULT 0"),
         ("start_timecode", "VARCHAR(13) NOT NULL DEFAULT '00:00:00:00'"),
     ],
+    "versions": [
+        ("origin_version_id", "INTEGER REFERENCES versions(id)"),
+        ("provenance", "JSON"),
+    ],
 }
 
 
@@ -39,15 +43,19 @@ def _migrate_ddl(conn) -> set[int]:
     """补列；返回升级前就存在的项目 id（其 shot_cuts 仍为毫秒）。"""
     inspector = inspect(conn)
     legacy_ids: set[int] = set()
-    if "projects" not in inspector.get_table_names():
-        return legacy_ids
-    existing = {c["name"] for c in inspector.get_columns("projects")}
-    if "rate_num" not in existing:
-        rows = conn.execute(text("SELECT id FROM projects")).fetchall()
-        legacy_ids = {r[0] for r in rows}
-    for column, ddl in _ADDED_COLUMNS["projects"]:
-        if column not in existing:
-            conn.execute(text(f"ALTER TABLE projects ADD COLUMN {column} {ddl}"))
+    tables = set(inspector.get_table_names())
+    if "projects" in tables:
+        existing = {c["name"] for c in inspector.get_columns("projects")}
+        if "rate_num" not in existing:
+            rows = conn.execute(text("SELECT id FROM projects")).fetchall()
+            legacy_ids = {r[0] for r in rows}
+    for table, columns in _ADDED_COLUMNS.items():
+        if table not in tables:
+            continue
+        existing = {c["name"] for c in inspector.get_columns(table)}
+        for column, ddl in columns:
+            if column not in existing:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
     return legacy_ids
 
 

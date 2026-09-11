@@ -2,7 +2,10 @@
 
 供字幕制作团队校正影视字幕断行和时间轴的 REST API。接收 SRT / WebVTT 字幕、
 帧率、镜头切点和一套可配置规范，逐条检测问题并给出原因与修正候选；自动修复
-接口会结合标点、语句长度和可用时间窗重新断句、分行并调整起止时间。
+接口会结合标点、语句长度和可用时间窗重新断句、分行并调整起止时间。双语对齐
+接口把同一项目中的源语言与译文版本按时间区间重叠生成 cue 映射，诊断译文漏条、
+顺序倒置、说话人标签不一致等同步问题，并给出以源 cue 边界为依据的拆分、合并
+与时间调整候选（不改写文本），选定候选可保存为关联原版本的新字幕版本。
 
 **全部处理在本地完成，不依赖任何外部模型或服务。**
 
@@ -119,8 +122,77 @@ GET    /projects/{id}/versions/{vid}     版本详情（含解析后的 cue）
 POST   /projects/{id}/versions/{vid}/qc        运行质检，返回问题清单（原因+修正候选）
 POST   /projects/{id}/versions/{vid}/autofix   自动修复并保存为新版本，返回修复与冲突
 GET    /projects/{id}/diff?from_version=&to_version=   比较两个版本（增/删/改）
-GET    /projects/{id}/versions/{vid}/export?format=srt|vtt|report
-                                               导出 SRT / WebVTT / JSON 质检报告
+GET    /projects/{id}/versions/{vid}/export?format=srt|vtt|report|frames
+                                               导出 SRT / WebVTT / JSON 质检报告 / 帧级 JSON
+```
+
+### 双语对齐
+
+```
+POST   /projects/{id}/align         源/译文轨道对齐检查：映射 + 诊断 + 修复候选
+POST   /projects/{id}/align/apply   应用选定候选，保存为关联原版本的新字幕版本
+```
+
+## 双语字幕轨道对齐
+
+把同一项目中的两个字幕版本指定为源语言（`source_version_id`）和译文
+（`target_version_id`），系统按**时间区间重叠**与**相邻顺序**生成
+一对一 / 一对多 / 多对一（以及多对多）cue 映射。
+
+### 阈值与候选策略
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `min_overlap_ms` | 200 | 判定匹配的最小重叠（换算为帧向上取整，至少 1 帧） |
+| `min_overlap_ratio` | 0.3 | 重叠比例阈值，任一侧低于该值报“重叠不足” |
+| `speaker_check` | true | 是否检查说话人标签一致性 |
+| `candidate_strategy` | `source_boundaries` | `source_boundaries`=以源 cue 边界拆分/合并/对齐；`proportional`=组内按比例映射到源跨度 |
+
+### 诊断项（字段化返回）
+
+| 类型 | 级别 | 说明 |
+|---|---|---|
+| `missing_translation` | error | 译文漏条：源 cue 没有对应的译文 cue |
+| `unmatched_target` | warning | 译文 cue 未匹配到任何源 cue |
+| `insufficient_overlap` | warning | 重叠比例低于阈值 |
+| `order_inversion` | error | 译文 cue 顺序与源顺序倒置 |
+| `speaker_mismatch` | warning | 说话人标签（`<v 张三>`、`- 张三：`、`【张三】`、`张三：`）不一致 |
+
+每组映射返回：映射类型、两侧 cue 的起止帧/毫秒/SMPTE 时间码、
+重叠帧数与重叠比例、该组问题清单和修复候选。
+
+### 修复候选（以源 cue 边界为依据，不改写文本）
+
+| 动作 | 适用 | 说明 |
+|---|---|---|
+| `retime_to_source` | 一对一 | 译文 cue 起止时间对齐到源 cue 边界 |
+| `merge_to_source` | 一对多 | 多条译文 cue 合并为一条，对齐到源 cue 跨度 |
+| `split_at_source_boundaries` | 多对一 | 译文 cue 在源 cue 边界处拆分（标点优先、按比例兜底，标签保持闭合） |
+| `fit_group_to_source` | 任意组 | 组内各译文 cue 按比例映射到源跨度（`proportional` 策略） |
+
+候选 id 形如 `m{映射号}.c{序号}`，在相同阈值下重算保持稳定。
+`/align/apply` 按 `candidate_ids` 选定候选（缺省应用全部），结果保存为
+**关联原译文版本**（`origin_version_id` + `provenance`）的新字幕版本，
+原稿保留；新版本可继续使用质检、差异比较与 SRT/WebVTT/帧级导出。
+
+```bash
+# 1. 对齐检查：源版本 1（中文）vs 译文版本 2（英文）
+curl -X POST localhost:8000/projects/1/align -H 'Content-Type: application/json' -d '{
+  "source_version_id": 1, "target_version_id": 2,
+  "min_overlap_ms": 200, "min_overlap_ratio": 0.3,
+  "candidate_strategy": "source_boundaries"
+}'
+
+# 2. 应用选定候选（缺省为全部候选），生成新版本
+curl -X POST localhost:8000/projects/1/align/apply -H 'Content-Type: application/json' -d '{
+  "source_version_id": 1, "target_version_id": 2,
+  "candidate_ids": ["m1.c1", "m3.c1"], "label": "英文-已对齐"
+}'
+
+# 3. 对新版本继续质检 / 比较 / 导出
+curl -X POST localhost:8000/projects/1/versions/3/qc
+curl "localhost:8000/projects/1/diff?from_version=2&to_version=3"
+curl -OJ "localhost:8000/projects/1/versions/3/export?format=srt"
 ```
 
 ## 使用示例
@@ -179,10 +251,13 @@ app/
   parsing.py   SRT/VTT 解析与序列化（保留说话人标签与样式）
   qc.py        质检规则（重叠/闪现/跨镜头/CPS/断行…）
   autofix.py   自动修复（断句、分行、时间窗调整、帧对齐、冲突处理）
+  align.py     双语轨道对齐（重叠分组、同步诊断、源边界拆分/合并/时间调整）
   diffing.py   版本差异比较
   schemas.py   Pydantic 请求/响应模型
   models.py    SQLAlchemy ORM（规则模板/项目/版本）
   database.py  SQLite 引擎与会话
 tests/
-  test_api.py  端到端 API 测试
+  test_api.py      端到端 API 测试
+  test_align.py    双语对齐与同步检查测试
+  test_timecode.py SMPTE 时间码与帧运算测试
 ```

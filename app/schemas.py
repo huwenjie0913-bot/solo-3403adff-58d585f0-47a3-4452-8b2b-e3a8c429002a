@@ -174,6 +174,10 @@ class VersionOut(BaseModel):
     label: str
     format: str
     cue_count: int
+    origin_version_id: int | None = Field(
+        None, description="派生来源版本 id（自动修复/对齐产生的新版本），原稿为 None")
+    provenance: dict[str, Any] | None = Field(
+        None, description="派生信息（来源类型、对齐参数、已应用候选等）")
     created_at: datetime
 
 
@@ -231,6 +235,131 @@ class DiffResponse(BaseModel):
     to_version: int
     summary: dict[str, Any]
     changes: list[dict[str, Any]]
+
+
+# ---------------------------------------------------------------- 双语对齐
+
+class AlignRequest(BaseModel):
+    """把同一项目中的两个版本指定为源语言与译文，进行轨道对齐检查。"""
+
+    source_version_id: int = Field(description="源语言字幕版本 id")
+    target_version_id: int = Field(description="译文字幕版本 id")
+    min_overlap_ms: int = Field(
+        200, ge=0, description="判定匹配的最小重叠（毫秒，按项目时间基换算为帧，至少 1 帧）")
+    min_overlap_ratio: float = Field(
+        0.3, ge=0, le=1, description="重叠比例阈值：任一侧低于该值报“重叠不足”")
+    speaker_check: bool = Field(True, description="是否检查说话人标签一致性")
+    candidate_strategy: Literal["source_boundaries", "proportional"] = Field(
+        "source_boundaries",
+        description="候选策略：source_boundaries=以源 cue 边界拆分/合并/对齐；"
+                    "proportional=组内按比例映射到源跨度")
+
+
+class AlignThresholds(BaseModel):
+    min_overlap_ms: int
+    min_overlap_frames: int = Field(description="min_overlap_ms 换算后的帧数（向上取整，至少 1 帧）")
+    min_overlap_ratio: float
+    speaker_check: bool
+    candidate_strategy: str
+
+
+class AlignCueRef(BaseModel):
+    index: int
+    start_frame: int
+    end_frame: int
+    start_ms: int
+    end_ms: int
+    start_tc: str
+    end_tc: str
+    speakers: list[str] = Field(default_factory=list)
+
+
+class AlignSide(BaseModel):
+    """映射组的一侧（源或译文）：跨度 + 组内各 cue。"""
+
+    indices: list[int]
+    start_frame: int
+    end_frame: int
+    start_ms: int
+    end_ms: int
+    start_tc: str
+    end_tc: str
+    speakers: list[str]
+    cues: list[AlignCueRef]
+
+
+class AlignIssue(BaseModel):
+    issue_type: str = Field(
+        description="missing_translation / unmatched_target / insufficient_overlap / "
+                    "order_inversion / speaker_mismatch")
+    severity: Literal["error", "warning"]
+    message: str = Field(description="问题原因")
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class AlignCandidate(BaseModel):
+    id: str = Field(description="候选 id（m{映射号}.c{序号}），apply 接口按 id 选定")
+    action: str = Field(
+        description="retime_to_source / merge_to_source / "
+                    "split_at_source_boundaries / fit_group_to_source")
+    description: str
+    params: dict[str, Any] = Field(
+        default_factory=dict, description="修复参数（帧号 + 毫秒 + SMPTE 时间码）")
+
+
+class MappingOut(BaseModel):
+    id: int
+    type: str = Field(description="one_to_one / one_to_many / many_to_one / many_to_many")
+    source: AlignSide
+    target: AlignSide
+    overlap_frames: int
+    overlap_ms: int
+    overlap_ratio_source: float = Field(description="重叠帧数 / 源组跨度")
+    overlap_ratio_target: float = Field(description="重叠帧数 / 译文组跨度")
+    issues: list[AlignIssue]
+    fix_candidates: list[AlignCandidate]
+
+
+class UnmatchedCueOut(BaseModel):
+    cue: AlignCueRef
+    issue_type: str = Field(description="missing_translation（译文漏条）/ unmatched_target")
+    severity: str
+    message: str
+
+
+class AlignReport(BaseModel):
+    project_id: int
+    source_version_id: int
+    target_version_id: int
+    generated_at: datetime
+    timebase: TimebaseOut
+    thresholds: AlignThresholds
+    summary: dict[str, Any]
+    mappings: list[MappingOut]
+    unmatched_source: list[UnmatchedCueOut] = Field(description="译文漏条（源侧未匹配）")
+    unmatched_target: list[UnmatchedCueOut] = Field(description="译文侧未匹配")
+
+
+class AlignApplyRequest(BaseModel):
+    """把选定候选应用到译文版本，保存为关联原版本的新字幕版本。"""
+
+    source_version_id: int
+    target_version_id: int
+    label: str | None = Field(None, max_length=100, description="新版本标签，缺省自动命名")
+    candidate_ids: list[str] | None = Field(
+        None, description="选定的候选 id 列表；缺省（null）应用全部候选，空列表表示不应用")
+    min_overlap_ms: int = Field(200, ge=0)
+    min_overlap_ratio: float = Field(0.3, ge=0, le=1)
+    speaker_check: bool = True
+    candidate_strategy: Literal["source_boundaries", "proportional"] = "source_boundaries"
+
+
+class AlignApplyResponse(BaseModel):
+    new_version_id: int
+    label: str
+    origin_version_id: int = Field(description="新版本的派生来源（译文版本 id）")
+    applied: list[dict[str, Any]] = Field(description="已应用的候选")
+    summary: dict[str, Any]
 
 
 # ---------------------------------------------------------------- 时间码换算
