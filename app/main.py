@@ -26,6 +26,15 @@ from .align import (
     unmatched_out,
 )
 from .autofix import auto_fix
+from .conform import (
+    ConformCandidateConflictError,
+    Segment as ConformSegment,
+    UnknownConformCandidateError,
+    apply_conform,
+    report_dict,
+    run_conform,
+)
+from .conform import ConformOptions as ConformOpts
 from .database import get_db, init_db
 from .diffing import diff_cues
 from .models import Project, RuleTemplate, TerminologyRule, Version
@@ -39,6 +48,14 @@ from .schemas import (
     AlignThresholds,
     AutoFixRequest,
     AutoFixResponse,
+    ConformApplyRequest,
+    ConformApplyResponse,
+    ConformPreviewItem,
+    ConformPreviewOutcome,
+    ConformPreviewRequest,
+    ConformPreviewResponse,
+    ConformReport,
+    ConformRequest,
     ConvertedPosition,
     ConvertRequest,
     CueOut,
@@ -98,7 +115,7 @@ init_db()  # 导入即建表（幂等），保证直接运行时数据库可用
 app = FastAPI(
     title="字幕断行与时间轴校正 API（SMPTE 时间码）",
     description="供字幕制作团队校正影视字幕断行和时间轴的本地服务，支持 SMPTE 时间码与有理数帧运算",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -257,7 +274,7 @@ def _structured_cues(cue_inputs: list, tb: Timebase) -> list[Cue]:
 def root():
     return {
         "service": "字幕断行与时间轴校正 API（SMPTE 时间码）",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "docs": "/docs",
         "endpoints": [
             "/rule-templates", "/projects", "/projects/{id}/versions",
@@ -269,6 +286,9 @@ def root():
             "/projects/{id}/terminology/check",
             "/projects/{id}/terminology/preview",
             "/projects/{id}/terminology/apply",
+            "/projects/{id}/conform",
+            "/projects/{id}/conform/preview",
+            "/projects/{id}/conform/apply",
             "/projects/{id}/convert", "/timecode/convert",
         ],
     }
@@ -842,6 +862,313 @@ def terminology_apply(project_id: int, body: TerminologyApplyRequest,
             "cue_count_before": len(tgt_cues),
             "cue_count_after": len(new_cues),
             "applied_count": len(applied),
+        })
+
+
+# ---------------------------------------------------------------- 剪辑改版字幕重套
+
+def _conform_segments(body_segments, tb: Timebase) -> list[ConformSegment]:
+    """把请求中的映射段解析为帧域 Segment；收集全部位置错误后一次性 400。"""
+    errors: list[dict] = []
+    segs: list[ConformSegment] = []
+    for i, sg in enumerate(body_segments):
+        try:
+            s0 = resolve_frame_field(_position_value(sg.source_start), tb,
+                                     f"segments[{i}].source_start")
+            s1 = resolve_frame_field(_position_value(sg.source_end), tb,
+                                     f"segments[{i}].source_end")
+        except TimecodeError as e:
+            errors.append({"field": e.field, "value": e.value, "reason": e.reason})
+            continue
+        if s1 <= s0:
+            errors.append({
+                "field": f"segments[{i}].source_end",
+                "value": _position_value(sg.source_end),
+                "reason": (f"源区间终点必须晚于起点：source_end 帧 {s1} <= "
+                           f"source_start 帧 {s0}")})
+            continue
+        deleted = sg.target_start is None
+        if deleted:
+            t0 = t1 = None
+        else:
+            try:
+                t0 = resolve_frame_field(_position_value(sg.target_start), tb,
+                                         f"segments[{i}].target_start")
+                t1 = resolve_frame_field(_position_value(sg.target_end), tb,
+                                         f"segments[{i}].target_end")
+            except TimecodeError as e:
+                errors.append({"field": e.field, "value": e.value,
+                               "reason": e.reason})
+                continue
+            if t1 < t0:
+                errors.append({
+                    "field": f"segments[{i}].target_end",
+                    "value": _position_value(sg.target_end),
+                    "reason": (f"改版区间终点不能早于起点：target_end 帧 {t1} < "
+                               f"target_start 帧 {t0}")})
+                continue
+            if t0 == t1:  # 零长目标区间视为删除段
+                deleted = True
+                t0 = t1 = None
+        segs.append(ConformSegment(i + 1, s0, s1, t0, t1))
+    if errors:
+        raise _PositionErrors(errors)
+    return segs
+
+
+def _run_conform_request(db: Session, project_id: int, body) -> tuple[
+        Project, Version, Timebase, "ConformOpts", object]:
+    """通用前置：取项目/版本、解析映射段与选项，运行重套（不校验 mapping_valid）。"""
+    p = _get_project(db, project_id)
+    v = _get_version(db, project_id, body.version_id)
+    tb = _project_tb(p)
+    segs = _conform_segments(body.segments, tb)
+    opts = ConformOpts.from_ms(
+        body.cut_tolerance_ms, body.min_duration_ms, body.merge_gap_ms,
+        body.cross_segment_strategy, tb)
+    result = run_conform(_cues_of(v, tb), segs, opts, tb)
+    return p, v, tb, opts, result
+
+
+@app.post("/projects/{project_id}/conform", response_model=ConformReport)
+def conform(project_id: int, body: ConformRequest, db: Session = Depends(get_db)):
+    """按剪辑映射生成重套计划：映射校验 + 逐条 cue 诊断与处理候选（不落库）。
+
+    映射段存在 error 级问题（重叠/倒序/目标冲突）时返回 400 并附字段化问题；
+    未映射区间为 warning 不阻断。保留段内字幕按有理数比例直接重套，跨切点、
+    落入删除段或映射到多段的 cue 返回移动/裁切/拆分/合并/人工候选。
+    """
+    p, v, tb, opts, result = _run_conform_request(db, project_id, body)
+    if not result.mapping_valid:
+        raise HTTPException(400, {
+            "message": "剪辑映射校验未通过，请先修正映射段",
+            "mapping_issues": [
+                {"issue_type": i.issue_type, "severity": i.severity,
+                 "message": i.message, "details": i.details}
+                for i in result.mapping_issues]})
+    return report_dict(
+        result, tb, project_id=p.id, version_id=v.id,
+        generated_at=datetime.now(timezone.utc),
+        cut_tolerance_ms=body.cut_tolerance_ms,
+        min_duration_ms=body.min_duration_ms,
+        merge_gap_ms=body.merge_gap_ms,
+        timebase=_tb_out(p).model_dump(mode="json"))
+
+
+def _conform_options_model(body, opts: ConformOpts):
+    from .schemas import ConformOptionsOut
+    return ConformOptionsOut(
+        cut_tolerance_ms=body.cut_tolerance_ms,
+        cut_tolerance_frames=opts.cut_tolerance_frames,
+        min_duration_ms=body.min_duration_ms,
+        min_duration_frames=opts.min_duration_frames,
+        merge_gap_ms=body.merge_gap_ms,
+        merge_gap_frames=opts.merge_gap_frames,
+        cross_segment_strategy=body.cross_segment_strategy)
+
+
+@app.post("/projects/{project_id}/conform/preview",
+          response_model=ConformPreviewResponse)
+def conform_preview(project_id: int, body: ConformPreviewRequest,
+                    db: Session = Depends(get_db)):
+    """预览改版前后时间码与映射来源；支持指定候选，不改原版本、不落库。"""
+    p, v, tb, opts, result = _run_conform_request(db, project_id, body)
+    if not result.mapping_valid:
+        raise HTTPException(400, "剪辑映射校验未通过，请先调用 /conform 查看问题")
+    try:
+        rows_by_cue, consumed, applied = _resolve_preview_rows(
+            result, body.candidate_ids)
+    except UnknownConformCandidateError as e:
+        raise HTTPException(400, f"未知候选 id: {', '.join(e.ids)}")
+    except ConformCandidateConflictError as e:
+        raise HTTPException(400, str(e))
+    items: list[ConformPreviewItem] = []
+    applied_by_cue = {a["cue_index"]: a for a in applied}
+    for pl in result.plans:
+        idx = pl.index
+        if idx in consumed and idx not in rows_by_cue:
+            continue
+        before = {
+            "start_frame": pl.cue.start_frame, "end_frame": pl.cue.end_frame,
+            "start_ms": tb.frames_to_ms(pl.cue.start_frame),
+            "end_ms": tb.frames_to_ms(pl.cue.end_frame),
+            "start_tc": format_smpte(tb, pl.cue.start_frame),
+            "end_tc": format_smpte(tb, pl.cue.end_frame),
+        }
+        rec = applied_by_cue.get(idx)
+        outs = []
+        for r in rows_by_cue.get(idx, []):
+            if r.manual:
+                action, cid = "manual", None
+            elif rec is not None:
+                action, cid = rec["action"], rec.get("candidate_id")
+            else:
+                action, cid = "direct_retime", None
+            outs.append(ConformPreviewOutcome(
+                action=action, candidate_id=cid, segment_id=r.segment_id,
+                before=before,
+                after={"start_frame": r.start_frame, "end_frame": r.end_frame,
+                       "start_ms": tb.frames_to_ms(r.start_frame),
+                       "end_ms": tb.frames_to_ms(r.end_frame),
+                       "start_tc": format_smpte(tb, r.start_frame),
+                       "end_tc": format_smpte(tb, r.end_frame)},
+                ratio_num=r.ratio.numerator if r.ratio is not None else None,
+                ratio_den=r.ratio.denominator if r.ratio is not None else None,
+                needs_manual=r.manual, lines=list(r.lines)))
+        merged_with = ([rec["merged_with"]]
+                       if rec and rec["action"] == "merge_adjacent" else [])
+        items.append(ConformPreviewItem(
+            cue_index=idx, before=before, outcomes=outs,
+            merged_with=merged_with))
+    return ConformPreviewResponse(
+        project_id=p.id, version_id=v.id, timebase=_tb_out(p),
+        options=_conform_options_model(body, opts), items=items)
+
+
+def _resolve_preview_rows(result, candidate_ids):
+    """与 apply_conform 相同的选择规则，但按源 cue 分组返回行（不排序/重编号）。
+
+    返回 ({cue_index: [Row]}, 被合并消费的 cue 集合, 应用记录)。
+    """
+    from .conform import Row, _fallback_manual, _rows_for_candidate
+
+    plans = result.plans
+    all_cand = {c.id: (pl, c) for pl in plans for c in pl.candidates}
+    if candidate_ids is None:
+        selected = [pl.proposed_id for pl in plans
+                    if pl.proposed_id and pl.cand(pl.proposed_id)]
+    else:
+        selected = list(dict.fromkeys(candidate_ids))
+        unknown = [cid for cid in selected if cid not in all_cand]
+        if unknown:
+            raise UnknownConformCandidateError(unknown)
+
+    chosen: dict[int, tuple[str, object]] = {}
+    consumed: set[int] = set()
+    for cid in selected:
+        pl, cand = all_cand[cid]
+        if pl.index in chosen:
+            raise ConformCandidateConflictError(
+                pl.index, chosen[pl.index][0], cid)
+        chosen[pl.index] = (cid, cand)
+        if cand.action == "merge_adjacent":
+            j = cand.params["merge_with"]
+            if j in chosen:
+                raise ConformCandidateConflictError(j, cid, chosen[j][0])
+            consumed.add(j)
+
+    rows_by_cue: dict[int, list] = {}
+    applied: list[dict] = []
+    for pl in plans:
+        idx = pl.index
+        if idx in consumed and idx not in chosen:
+            continue
+        if idx in chosen:
+            cid, cand = chosen[idx]
+            rows = _rows_for_candidate(pl, cand)
+            if cand.action == "merge_adjacent":
+                j = cand.params["merge_with"]
+                other = next(p for p in plans if p.index == j).cue
+                rows[0].lines = list(pl.cue.lines) + list(other.lines)
+                consumed.add(j)
+                applied.append({"candidate_id": cid, "cue_index": idx,
+                                "action": "merge_adjacent", "merged_with": j,
+                                "segment_id": cand.params.get("segment_id"),
+                                "to": cand.params["to"]})
+            else:
+                rec = {"candidate_id": cid, "cue_index": idx,
+                       "action": cand.action, "manual": cand.manual,
+                       "segment_id": cand.params.get("segment_id")}
+                if "to" in cand.params:
+                    rec["to"] = cand.params["to"]
+                applied.append(rec)
+        else:
+            kept = [p for p in pl.parts if p.kind == "kept"]
+            if pl.status == "direct" and len(kept) == 1:
+                p = kept[0]
+                rows = [Row(idx, p.segment_id, p.t0, p.t1,
+                            list(pl.cue.lines), pl.cue.identifier,
+                            pl.cue.settings)]
+                applied.append({"cue_index": idx, "action": "direct_retime",
+                                "segment_id": p.segment_id})
+            else:
+                rows = [_fallback_manual(pl)]
+                applied.append({"cue_index": idx, "action": "manual",
+                                "reason": pl.status})
+        rows_by_cue[idx] = rows
+    return rows_by_cue, consumed, applied
+
+
+@app.post("/projects/{project_id}/conform/apply",
+          response_model=ConformApplyResponse, status_code=201)
+def conform_apply(project_id: int, body: ConformApplyRequest,
+                  db: Session = Depends(get_db)):
+    """应用重套计划，保存为带剪辑映射快照的新字幕版本（原稿保留）。
+
+    新版本可继续用于质检、版本比较及 SRT / WebVTT / 帧级导出。
+    """
+    p, v, tb, opts, result = _run_conform_request(db, project_id, body)
+    if not result.mapping_valid:
+        raise HTTPException(400, "剪辑映射校验未通过，请先调用 /conform 查看问题")
+    try:
+        new_cues, applied = apply_conform(result, body.candidate_ids)
+    except UnknownConformCandidateError as e:
+        raise HTTPException(400, f"未知候选 id: {', '.join(e.ids)}")
+    except ConformCandidateConflictError as e:
+        raise HTTPException(400, str(e))
+    label = body.label or f"{v.label}-reconform"
+    src_fmt = v.format if v.format in ("srt", "vtt") else "srt"
+    nv = Version(
+        project_id=project_id, label=label, format=v.format,
+        content=serialize(new_cues, tb, src_fmt),
+        cues=[c.to_dict() for c in new_cues],
+        origin_version_id=v.id,
+        provenance={
+            "kind": "conform",
+            "origin_version_id": v.id,
+            "options": {
+                "cut_tolerance_ms": body.cut_tolerance_ms,
+                "min_duration_ms": body.min_duration_ms,
+                "merge_gap_ms": body.merge_gap_ms,
+                "cross_segment_strategy": body.cross_segment_strategy,
+            },
+            "applied": applied,
+            # 剪辑映射快照：之后请求参数变化不影响本版本
+            "mapping_snapshot": [
+                {"id": s.id,
+                 "source_start_frame": s.s0, "source_end_frame": s.s1,
+                 "source_start_ms": tb.frames_to_ms(s.s0),
+                 "source_end_ms": tb.frames_to_ms(s.s1),
+                 "source_start_tc": format_smpte(tb, s.s0),
+                 "source_end_tc": format_smpte(tb, s.s1),
+                 "target_start_frame": s.t0, "target_end_frame": s.t1,
+                 "target_start_ms": (tb.frames_to_ms(s.t0)
+                                     if s.t0 is not None else None),
+                 "target_end_ms": (tb.frames_to_ms(s.t1)
+                                   if s.t1 is not None else None),
+                 "target_start_tc": (format_smpte(tb, s.t0)
+                                     if s.t0 is not None else None),
+                 "target_end_tc": (format_smpte(tb, s.t1)
+                                   if s.t1 is not None else None),
+                 "deleted": s.deleted,
+                 "ratio_num": s.ratio.numerator,
+                 "ratio_den": s.ratio.denominator}
+                for s in result.segments],
+        })
+    db.add(nv)
+    db.commit()
+    db.refresh(nv)
+    manual = sum(1 for a in applied if a["action"] == "manual")
+    return ConformApplyResponse(
+        new_version_id=nv.id, label=label, origin_version_id=v.id,
+        applied=applied,
+        summary={
+            "cue_count_before": len(v.cues),
+            "cue_count_after": len(new_cues),
+            "applied_count": len(applied),
+            "manual_count": manual,
+            "direct_retime_count": sum(
+                1 for a in applied if a["action"] == "direct_retime"),
         })
 
 

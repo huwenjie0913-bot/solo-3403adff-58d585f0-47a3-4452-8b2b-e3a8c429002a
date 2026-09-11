@@ -10,6 +10,13 @@
 不一致、禁用变体与大小写错误，并生成不改时间码、标签和换行的精确替换候选，
 可预览或应用为带来源与术语规则快照的新版本。
 
+**剪辑改版字幕重套**模块接收原字幕版本与源/目标时间线的剪辑映射段，先校验
+映射本身（源侧重叠、输入倒序、改版段冲突、未映射区间），再按映射用有理数
+比例重算 cue 时间并落到合法帧；保留段内字幕直接重套，跨切点、落入删除段或
+映射到多个目标段的 cue 返回字段化诊断与移动/裁切/按标点拆分/合并相邻/转人工
+候选。预览展示改版前后时间码与映射来源（不改原稿），应用后保存带映射快照的
+新版本，可继续质检、版本比较与 SRT/WebVTT/帧级导出。
+
 **全部处理在本地完成，不依赖任何外部模型或服务。**
 
 技术栈：Python 3.11+ · FastAPI · Pydantic v2 · SQLAlchemy 2 · SQLite
@@ -148,6 +155,114 @@ POST   /projects/{id}/terminology/check           复用时间重叠映射逐组
 POST   /projects/{id}/terminology/preview         按候选 id 预览替换后的行（不落库）
 POST   /projects/{id}/terminology/apply           应用选定候选，保存为带来源+规则快照的新版本
 ```
+
+### 剪辑改版字幕重套
+
+```
+POST   /projects/{id}/conform                     剪辑映射校验 + 逐条 cue 重套计划与候选（不落库）
+POST   /projects/{id}/conform/preview             预览改版前后时间码、映射来源与候选结果（不落库）
+POST   /projects/{id}/conform/apply               应用重套，保存为带剪辑映射快照的新版本
+```
+
+## 剪辑改版字幕重套（re-conform）
+
+剪辑改版后，把旧版字幕按剪辑映射重新套到改版时间线。请求给出**原字幕版本**
+与一组剪辑映射段，每段描述源时间线区间到改版（目标）时间线区间的对应关系：
+
+- 目标起止为**合法帧位置**，支持毫秒数字、`NNNf` 帧号、SMPTE 时间码与
+  `{ms|frame|timecode}` 位置对象；
+- `target_start` / `target_end` **同时省略**（或相等）表示**删除段**
+  （该段源素材在改版中被剪掉）；
+- 目标时长与源时长不同即为**变速片段**：cue 时间按段比例
+  （`target_frames / source_frames`，`Fraction` 有理数）换算，半向上取整到
+  合法整数帧，不产生浮点漂移。
+
+### 映射段校验
+
+| 类型 | 级别 | 说明 |
+|---|---|---|
+| `source_overlap` | error | 两段映射的源区间重叠（端点相接允许） |
+| `order_reversed` | error | 映射段输入顺序倒置（后段源起点早于前段） |
+| `target_conflict` | error | 两条保留段映射到同一改版区间 |
+| `unmapped_source` | warning | 源时间线相邻段之间的空隙（素材删除；落入的 cue 按删除处理） |
+| `unmapped_target` | warning | 源侧相邻保留段映射后改版出现空隙（黑场/新增镜头） |
+
+存在 error 级映射问题时接口返回 400 并附字段化问题，不生成 cue 结果；
+warning 不阻断。
+
+### 可配置参数
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `cut_tolerance_ms` | 0 | 切点容差：cue 边界距切点不超过该值时吸附到切点，不算跨切点 |
+| `min_duration_ms` | 1000 | 重套后最短显示时间；变速压缩导致更短报 `duration_too_short` |
+| `merge_gap_ms` | 0 | 合并间隔：改版后相邻 cue 间隔不超过该值时给出合并候选 |
+| `cross_segment_strategy` | `move` | 跨段默认策略：`move` / `trim` / `split` / `merge` / `manual` |
+
+### cue 诊断（字段化返回）
+
+| 类型 | 级别 | 说明 |
+|---|---|---|
+| `cross_cut` | error | cue 跨越切点、覆盖多个保留段，或部分落入删除/未映射区间 |
+| `in_deleted_segment` | error | cue 完全落入删除段/未映射区间，改版后无对应位置（默认转人工，不自动丢弃） |
+| `duration_too_short` | warning | 变速重套后短于最短显示时间 |
+| `target_cue_overlap` | warning | 重套后两条 cue 在改版时间线重叠 |
+
+每条 cue 返回覆盖片段（保留段/删除段/未映射洞及各自映射时间）、问题清单、
+默认策略下的重套结果（`mapped_cues`，含映射来源段 id 与变速比例）和候选。
+
+### 处理候选
+
+| 动作 | 适用 | 说明 |
+|---|---|---|
+| `move` | 跨切点 / 删除 / 过短 | 整条移动到主保留段（重叠最大）映射区间，或在段内延长到最短时长 |
+| `trim` | 跨切点 | 裁切到主保留段映射区间，丢弃切点另一侧的时间（文本不改） |
+| `split_at_punctuation` | 跨多保留段 | 按句末/从句标点把文本拆成各保留段一条（标签保持闭合，无合适标点不给此候选） |
+| `merge_adjacent` | 改版后相邻 | 与相邻 cue 合并为一条（保留各自换行，identifier/settings 取首条） |
+| `manual` | 任意 | 转人工：保留原时间码并标记 `needs_manual` |
+
+候选 id 形如 `q{cue 序号}.c{序号}`，同输入下重算稳定。文本、说话人/样式
+标签、换行结构、WebVTT cue identifier 与 settings 全程保留。
+
+### 预览与应用
+
+`/conform/preview` 按候选（或默认策略）展示每条 cue **改版前/改版后**的
+帧号、毫秒、SMPTE 时间码、映射来源段与变速比例，不落库、不改原稿；
+`/conform/apply` 保存为**关联原版本**（`origin_version_id` + `provenance`）
+的新版本，`provenance` 含参数、应用记录与**剪辑映射快照**（之后请求变化
+不影响该版本）。新版本可继续质检、版本比较及 SRT / WebVTT / 帧级导出。
+
+```bash
+# 1. 生成重套计划（含映射校验、诊断与候选）
+curl -X POST localhost:8000/projects/1/conform -H 'Content-Type: application/json' -d '{
+  "version_id": 1,
+  "cut_tolerance_ms": 80, "min_duration_ms": 1000,
+  "merge_gap_ms": 0, "cross_segment_strategy": "move",
+  "segments": [
+    {"source_start": "00:00:00:00", "source_end": "00:00:18:00",
+     "target_start": "00:00:00:00", "target_end": "00:00:18:00"},
+    {"source_start": "00:00:20:00", "source_end": "00:00:40:00",
+     "target_start": "00:00:18:00", "target_end": "00:00:28:00"}
+  ]
+}'
+
+# 2. 预览选定候选（如把第 2 条跨切点 cue 按标点拆分）
+curl -X POST localhost:8000/projects/1/conform/preview -H 'Content-Type: application/json' -d '{
+  "version_id": 1, "candidate_ids": ["q2.c3"], "segments": [ ...同上... ]
+}'
+
+# 3. 应用（candidate_ids 缺省走默认策略，空列表表示问题 cue 全部转人工）
+curl -X POST localhost:8000/projects/1/conform/apply -H 'Content-Type: application/json' -d '{
+  "version_id": 1, "candidate_ids": ["q2.c3"], "label": "改版套片",
+  "segments": [ ...同上... ]
+}'
+
+# 4. 对新版本继续质检 / 比较 / 导出
+curl -X POST localhost:8000/projects/1/versions/3/qc
+curl "localhost:8000/projects/1/diff?from_version=1&to_version=3"
+curl -OJ "localhost:8000/projects/1/versions/3/export?format=srt"
+```
+
 
 ## 双语字幕轨道对齐
 
@@ -341,6 +456,7 @@ app/
   autofix.py   自动修复（断句、分行、时间窗调整、帧对齐、冲突处理）
   align.py     双语轨道对齐（重叠分组、同步诊断、源边界拆分/合并/时间调整）
   terminology.py 双语术语一致性（重叠映射逐组核对、禁用/大小写/不一致/未译、精确替换）
+  conform.py   剪辑改版字幕重套（映射校验、有理数变速重算、跨切点/删除段诊断与候选）
   diffing.py   版本差异比较
   schemas.py   Pydantic 请求/响应模型
   models.py    SQLAlchemy ORM（规则模板/项目/版本/术语条目）
@@ -349,5 +465,6 @@ tests/
   test_api.py      端到端 API 测试
   test_align.py    双语对齐与同步检查测试
   test_terminology.py 双语术语一致性测试
+  test_conform.py  剪辑改版字幕重套测试
   test_timecode.py SMPTE 时间码与帧运算测试
 ```

@@ -677,3 +677,219 @@ class TerminologyApplyResponse(BaseModel):
     origin_version_id: int = Field(description="新版本的派生来源（译文版本 id）")
     applied: list[dict[str, Any]] = Field(description="已应用的精确替换")
     summary: dict[str, Any]
+
+
+# ---------------------------------------------------------------- 剪辑改版字幕重套
+
+ConformStrategy = Literal["move", "trim", "split", "merge", "manual"]
+
+
+class ConformSegmentInput(BaseModel):
+    """一条剪辑映射：源时间线区间 -> 改版（目标）时间线区间。
+
+    目标区间起止相等（或均不提供）表示**删除段**：该段源素材在改版中被剪掉。
+    位置接受毫秒数字 / 'NNNf' 帧号 / SMPTE 时间码 / 位置对象。
+    """
+
+    source_start: PositionLike = Field(description="源时间线起点（毫秒 / 帧号 / 时间码）")
+    source_end: PositionLike = Field(description="源时间线终点（毫秒 / 帧号 / 时间码）")
+    target_start: PositionLike | None = Field(
+        None, description="改版时间线起点；与 target_end 同时省略表示删除段")
+    target_end: PositionLike | None = Field(
+        None, description="改版时间线终点；与 target_start 相等表示删除段")
+
+    @model_validator(mode="after")
+    def _check_target_pair(self) -> "ConformSegmentInput":
+        if (self.target_start is None) != (self.target_end is None):
+            raise ValueError("target_start 与 target_end 必须同时提供，或同时省略（删除段）")
+        return self
+
+
+class ConformRequest(BaseModel):
+    """按剪辑映射把原字幕版本重套到改版时间线（检查 + 生成计划与候选，不落库）。"""
+
+    version_id: int = Field(description="原字幕版本 id")
+    segments: list[ConformSegmentInput] = Field(
+        ..., min_length=1, description="剪辑映射段（按源时间线先后给出）")
+    cut_tolerance_ms: int = Field(
+        0, ge=0, description="切点容差：cue 边界距切点不超过该值视为未跨切点")
+    min_duration_ms: int = Field(
+        1000, ge=0, description="重套后最短显示时间；变速压缩导致更短时报“时长过短”")
+    merge_gap_ms: int = Field(
+        0, ge=0, description="合并间隔：改版后相邻 cue 间隔不超过该值时给出合并候选")
+    cross_segment_strategy: ConformStrategy = Field(
+        "move",
+        description="跨段默认处理策略：move=移动 / trim=裁切 / split=按标点拆分 / "
+                    "merge=合并相邻 / manual=转人工")
+
+
+class ConformOptionsOut(BaseModel):
+    cut_tolerance_ms: int
+    cut_tolerance_frames: int
+    min_duration_ms: int
+    min_duration_frames: int
+    merge_gap_ms: int
+    merge_gap_frames: int
+    cross_segment_strategy: ConformStrategy
+
+
+class ConformSegmentOut(BaseModel):
+    id: int = Field(description="映射段序号（按请求中的顺序，1 起，候选/快照引用此 id）")
+    source: dict[str, Any]
+    target: dict[str, Any] | None = Field(None, description="删除段为 null")
+    deleted: bool
+    source_duration_frames: int
+    target_duration_frames: int
+    ratio_num: int = Field(description="变速比例分子（目标帧/源帧，1/1 为原速）")
+    ratio_den: int
+    retimed: bool = Field(description="是否变速片段（比例 != 1）")
+
+
+class ConformMapIssue(BaseModel):
+    issue_type: str = Field(
+        description="source_overlap / order_reversed / target_conflict / "
+                    "unmapped_source / unmapped_target")
+    severity: Literal["error", "warning"]
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConformCueRef(BaseModel):
+    index: int
+    start_frame: int
+    end_frame: int
+    start_ms: int
+    end_ms: int
+    start_tc: str
+    end_tc: str
+    lines: list[str]
+    identifier: str | None = None
+    settings: str | None = None
+
+
+class ConformPartOut(BaseModel):
+    """cue 在源时间线上覆盖的一个片段：映射段或未映射（删除）区间。"""
+
+    kind: Literal["kept", "deleted_segment", "unmapped_gap"]
+    segment_id: int | None = Field(None, description="命中的映射段 id；未映射区间为 null")
+    source: dict[str, Any] = Field(description="cue 落在该段内的源区间（帧/毫秒/时间码）")
+    target: dict[str, Any] | None = Field(None, description="映射后的改版区间；删除/未映射为 null")
+    overlap_frames: int = Field(description="cue 与该片段的源侧重叠帧数")
+
+
+class ConformCueIssue(BaseModel):
+    issue_type: str = Field(
+        description="cross_cut / in_deleted_segment / duration_too_short / target_cue_overlap")
+    severity: Literal["error", "warning"]
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConformCandidateOut(BaseModel):
+    id: str = Field(description="候选 id（q{cue 序号}.c{候选序号}），preview/apply 按 id 选定")
+    action: str = Field(description="move / trim / split_at_punctuation / merge_adjacent / manual")
+    description: str
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConformMappedCue(BaseModel):
+    """默认策略下 cue 重套后的一条结果（改版时间线）。"""
+
+    cue_index: int = Field(description="来源 cue 序号（拆分时多条结果指向同一 cue）")
+    segment_id: int | None = Field(None, description="映射来源段 id；人工处理为 null")
+    start_frame: int
+    end_frame: int
+    start_ms: int
+    end_ms: int
+    start_tc: str
+    end_tc: str
+    ratio_num: int | None = None
+    ratio_den: int | None = None
+    needs_manual: bool = False
+
+
+class ConformCueResult(BaseModel):
+    status: Literal["direct", "cross_cut", "in_deleted"]
+    cue: ConformCueRef
+    snapped_start: bool = Field(description="起点是否按切点容差吸附到切点")
+    snapped_end: bool
+    parts: list[ConformPartOut] = Field(description="cue 覆盖的源片段（含删除/未映射区间）")
+    issues: list[ConformCueIssue]
+    mapped_cues: list[ConformMappedCue] = Field(
+        description="默认跨段策略下的重套结果（直接重套时为 1 条）")
+    fix_candidates: list[ConformCandidateOut] = Field(default_factory=list)
+    proposed_candidate_id: str | None = Field(
+        None, description="默认策略选定的候选 id；直接重套/无候选为 null")
+
+
+class ConformReport(BaseModel):
+    project_id: int
+    version_id: int
+    generated_at: datetime
+    timebase: TimebaseOut
+    options: ConformOptionsOut
+    mapping_valid: bool = Field(
+        description="映射段是否通过 error 级校验；false 时不生成 cue 重套结果")
+    segments: list[ConformSegmentOut]
+    mapping_issues: list[ConformMapIssue]
+    summary: dict[str, Any]
+    cues: list[ConformCueResult] = Field(
+        default_factory=list, description="逐条 cue 的重套计划（mapping_valid=false 时为空）")
+
+
+class _ConformSelectionBase(BaseModel):
+    version_id: int
+    segments: list[ConformSegmentInput]
+    cut_tolerance_ms: int = 0
+    min_duration_ms: int = 1000
+    merge_gap_ms: int = 0
+    cross_segment_strategy: ConformStrategy = "move"
+
+
+class ConformPreviewRequest(_ConformSelectionBase):
+    candidate_ids: list[str] | None = Field(
+        None, description="选定的候选 id；缺省（null）用默认策略候选，空列表表示全部转人工")
+
+
+class ConformPreviewOutcome(BaseModel):
+    action: str = Field(description="direct_retime / move / trim / split_at_punctuation / "
+                                    "merge_adjacent / manual")
+    candidate_id: str | None = None
+    segment_id: int | None
+    before: dict[str, Any]
+    after: dict[str, Any]
+    ratio_num: int | None = None
+    ratio_den: int | None = None
+    needs_manual: bool = False
+    lines: list[str]
+
+
+class ConformPreviewItem(BaseModel):
+    cue_index: int
+    before: dict[str, Any] = Field(description="改版前时间码（原版本）")
+    outcomes: list[ConformPreviewOutcome] = Field(
+        description="改版后结果（拆分/合并时可能为多条；合并时含相邻 cue 文本）")
+    merged_with: list[int] = Field(
+        default_factory=list, description="合并候选时被并入的相邻 cue 序号")
+
+
+class ConformPreviewResponse(BaseModel):
+    project_id: int
+    version_id: int
+    timebase: TimebaseOut
+    options: ConformOptionsOut
+    items: list[ConformPreviewItem]
+
+
+class ConformApplyRequest(_ConformSelectionBase):
+    label: str | None = Field(None, max_length=100, description="新版本标签，缺省自动命名")
+    candidate_ids: list[str] | None = Field(
+        None, description="选定的候选 id；缺省（null）用默认策略候选，空列表表示全部转人工")
+
+
+class ConformApplyResponse(BaseModel):
+    new_version_id: int
+    label: str
+    origin_version_id: int = Field(description="新版本的派生来源（原字幕版本 id）")
+    applied: list[dict[str, Any]]
+    summary: dict[str, Any]
