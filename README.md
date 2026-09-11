@@ -6,6 +6,9 @@
 接口把同一项目中的源语言与译文版本按时间区间重叠生成 cue 映射，诊断译文漏条、
 顺序倒置、说话人标签不一致等同步问题，并给出以源 cue 边界为依据的拆分、合并
 与时间调整候选（不改写文本），选定候选可保存为关联原版本的新字幕版本。
+**双语术语一致性**模块在同一时间重叠映射上逐组核对术语表：源词未译、译法
+不一致、禁用变体与大小写错误，并生成不改时间码、标签和换行的精确替换候选，
+可预览或应用为带来源与术语规则快照的新版本。
 
 **全部处理在本地完成，不依赖任何外部模型或服务。**
 
@@ -133,6 +136,19 @@ POST   /projects/{id}/align         源/译文轨道对齐检查：映射 + 诊�
 POST   /projects/{id}/align/apply   应用选定候选，保存为关联原版本的新字幕版本
 ```
 
+### 双语术语一致性
+
+```
+POST   /projects/{id}/terminology                 新增术语条目（项目内源语词条唯一，重名 409）
+GET    /projects/{id}/terminology                 术语表列表
+GET    /projects/{id}/terminology/{tid}           条目详情
+PUT    /projects/{id}/terminology/{tid}           局部更新（变体字段整体替换）
+DELETE /projects/{id}/terminology/{tid}           删除条目（已生成报告/新版本为快照，不受影响）
+POST   /projects/{id}/terminology/check           复用时间重叠映射逐组核对，返回字段化问题与替换候选
+POST   /projects/{id}/terminology/preview         按候选 id 预览替换后的行（不落库）
+POST   /projects/{id}/terminology/apply           应用选定候选，保存为带来源+规则快照的新版本
+```
+
 ## 双语字幕轨道对齐
 
 把同一项目中的两个字幕版本指定为源语言（`source_version_id`）和译文
@@ -195,6 +211,73 @@ curl "localhost:8000/projects/1/diff?from_version=2&to_version=3"
 curl -OJ "localhost:8000/projects/1/versions/3/export?format=srt"
 ```
 
+## 双语术语一致性
+
+在同一项目内维护术语表，检查接口指定源语言版本与译文版本，**复用双语对齐
+的时间区间重叠映射**（同一套 `min_overlap_ms` / `min_overlap_ratio` 阈值），
+逐组核对每个词条：源词在组内任一侧 cue 出现即纳入核对。
+
+### 术语条目字段
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `source_term` | 必填 | 源语词条（项目内唯一） |
+| `preferred_translation` | 必填 | 首选译法；精确替换候选的替换文本 |
+| `acceptable_variants` | `[]` | 可接受变体：命中不算未译，但跨组不一致时仍会报告 |
+| `forbidden_variants` | `[]` | 禁用变体：命中报 error/warning 并建议改为首选译法（不能与首选/可接受重合） |
+| `case_sensitive` | `false` | 大小写敏感；为 true 时仅忽略大小写命中的写法报“大小写错误” |
+| `whole_word` | `true` | 整词匹配：拉丁词按词界匹配（`depart` 不命中 `departed`）；CJK 不受影响 |
+| `severity` | `error` | 该词条问题的严重级别（`error` / `warning`） |
+
+### 诊断项（字段化返回，每条问题含规则、两侧 cue、实际片段、上下文与原因）
+
+| 类型 | 说明 |
+|---|---|
+| `term_untranslated` | 源词在组内出现，但译文没有首选译法或任何可接受变体（含未匹配源 cue 的译文漏条，后者无候选） |
+| `term_inconsistent` | 同一术语跨组（或同组内）译法不统一；标准用法首选译法优先，否则取跨组出现最多者 |
+| `term_forbidden_variant` | 译文出现禁用变体，候选替换为首选译法 |
+| `term_case_error` | 大小写敏感条目下，命中片段与规范写法只有大小写差异；候选改为规范拼写 |
+
+命中片段给出所在 cue/行、去标签可见文本中的字符位置、前后文与命中原文。
+
+### 精确替换候选
+
+候选 id 形如 `t{映射组号}.r{术语id}.c{序号}`（未匹配源 cue 无候选），同阈值与
+术语表下重算稳定。候选只替换译文行内与变体**逐字一致**的原始文本片段：
+**不改时间码、不增删行（换行保持）、标签原样保留**；片段整段位于标签内时
+正常替换，片段跨越标签（如 `adm<i>i</i>n`）时不出候选。同一片段可预览，
+应用时做区间冲突与原文校验，失配返回 409。
+
+`/terminology/apply` 按 `candidate_ids` 选定（缺省应用全部，空列表不应用），
+保存为**关联原译文版本**的新版本，`provenance` 记录来源版本、阈值、
+已应用候选 id 与**术语规则快照**；原稿保留，新版本可继续质检、差异比较
+及 SRT / WebVTT / 帧级导出。
+
+```bash
+# 1. 维护术语表
+curl -X POST localhost:8000/projects/1/terminology -H 'Content-Type: application/json' -d '{
+  "source_term": "出发", "preferred_translation": "depart",
+  "acceptable_variants": ["set off"], "forbidden_variants": ["leave"],
+  "case_sensitive": false, "whole_word": true, "severity": "error"
+}'
+
+# 2. 逐组核对（复用时间重叠映射）
+curl -X POST localhost:8000/projects/1/terminology/check \
+  -H 'Content-Type: application/json' -d '{
+    "source_version_id": 1, "target_version_id": 2,
+    "min_overlap_ms": 200, "min_overlap_ratio": 0.3
+  }'
+
+# 3. 按候选 id 预览 / 应用
+curl -X POST localhost:8000/projects/1/terminology/preview \
+  -H 'Content-Type: application/json' -d '{
+    "source_version_id": 1, "target_version_id": 2,
+    "candidate_ids": ["t3.r1.c1"]}'
+curl -X POST localhost:8000/projects/1/terminology/apply \
+  -H 'Content-Type: application/json' -d '{
+    "source_version_id": 1, "target_version_id": 2, "label": "英文-术语统一"}'
+```
+
 ## 使用示例
 
 ```bash
@@ -252,12 +335,14 @@ app/
   qc.py        质检规则（重叠/闪现/跨镜头/CPS/断行…）
   autofix.py   自动修复（断句、分行、时间窗调整、帧对齐、冲突处理）
   align.py     双语轨道对齐（重叠分组、同步诊断、源边界拆分/合并/时间调整）
+  terminology.py 双语术语一致性（重叠映射逐组核对、禁用/大小写/不一致/未译、精确替换）
   diffing.py   版本差异比较
   schemas.py   Pydantic 请求/响应模型
-  models.py    SQLAlchemy ORM（规则模板/项目/版本）
+  models.py    SQLAlchemy ORM（规则模板/项目/版本/术语条目）
   database.py  SQLite 引擎与会话
 tests/
   test_api.py      端到端 API 测试
   test_align.py    双语对齐与同步检查测试
+  test_terminology.py 双语术语一致性测试
   test_timecode.py SMPTE 时间码与帧运算测试
 ```

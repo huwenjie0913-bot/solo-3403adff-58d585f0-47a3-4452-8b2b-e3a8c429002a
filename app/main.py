@@ -28,7 +28,7 @@ from .align import (
 from .autofix import auto_fix
 from .database import get_db, init_db
 from .diffing import diff_cues
-from .models import Project, RuleTemplate, Version
+from .models import Project, RuleTemplate, TerminologyRule, Version
 from .parsing import Cue, parse_shot_cuts, parse_subtitles, serialize
 from .qc import run_qc, summarize
 from .schemas import (
@@ -53,6 +53,15 @@ from .schemas import (
     RuleTemplateUpdate,
     Rules,
     StandaloneConvertRequest,
+    TerminologyApplyRequest,
+    TerminologyApplyResponse,
+    TerminologyCheckRequest,
+    TerminologyPreviewRequest,
+    TerminologyPreviewResponse,
+    TerminologyReport,
+    TerminologyRuleCreate,
+    TerminologyRuleOut,
+    TerminologyRuleUpdate,
     TimebaseOut,
     TimebaseSpec,
     VersionCreate,
@@ -65,6 +74,14 @@ from .timecode import (
     build_timebase,
     format_smpte,
     resolve_frame_field,
+)
+from .terminology import (
+    TermCandidateConflictError,
+    TermCandidateStaleError,
+    UnknownTermCandidateError,
+    apply_terminology,
+    preview_terminology,
+    run_terminology,
 )
 
 
@@ -80,7 +97,7 @@ init_db()  # 导入即建表（幂等），保证直接运行时数据库可用
 app = FastAPI(
     title="字幕断行与时间轴校正 API（SMPTE 时间码）",
     description="供字幕制作团队校正影视字幕断行和时间轴的本地服务，支持 SMPTE 时间码与有理数帧运算",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -239,7 +256,7 @@ def _structured_cues(cue_inputs: list, tb: Timebase) -> list[Cue]:
 def root():
     return {
         "service": "字幕断行与时间轴校正 API（SMPTE 时间码）",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "docs": "/docs",
         "endpoints": [
             "/rule-templates", "/projects", "/projects/{id}/versions",
@@ -247,6 +264,10 @@ def root():
             "/projects/{id}/versions/{vid}/autofix",
             "/projects/{id}/versions/{vid}/export", "/projects/{id}/diff",
             "/projects/{id}/align", "/projects/{id}/align/apply",
+            "/projects/{id}/terminology",
+            "/projects/{id}/terminology/check",
+            "/projects/{id}/terminology/preview",
+            "/projects/{id}/terminology/apply",
             "/projects/{id}/convert", "/timecode/convert",
         ],
     }
@@ -581,6 +602,235 @@ def align_apply(project_id: int, body: AlignApplyRequest,
     db.commit()
     db.refresh(nv)
     return AlignApplyResponse(
+        new_version_id=nv.id, label=label, origin_version_id=tv.id,
+        applied=applied,
+        summary={
+            "cue_count_before": len(tgt_cues),
+            "cue_count_after": len(new_cues),
+            "applied_count": len(applied),
+        })
+
+
+# ---------------------------------------------------------------- 版本比较
+
+def _get_term_rule(db: Session, project_id: int, rule_id: int) -> TerminologyRule:
+    t = db.get(TerminologyRule, rule_id)
+    if t is None or t.project_id != project_id:
+        raise HTTPException(404, "术语条目不存在")
+    return t
+
+
+def _term_rule_out(t: TerminologyRule) -> TerminologyRuleOut:
+    return TerminologyRuleOut.model_validate(t)
+
+
+# ------------------------------------------------ 术语表维护
+
+@app.post("/projects/{project_id}/terminology",
+          response_model=TerminologyRuleOut, status_code=201)
+def create_term_rule(project_id: int, body: TerminologyRuleCreate,
+                     db: Session = Depends(get_db)):
+    """在项目术语表中新增条目（source_term 在项目内唯一，重名 409）。"""
+    _get_project(db, project_id)
+    if db.query(TerminologyRule).filter_by(
+            project_id=project_id, source_term=body.source_term).first():
+        raise HTTPException(409, f"源语词条已存在：{body.source_term}")
+    t = TerminologyRule(
+        project_id=project_id, source_term=body.source_term,
+        preferred_translation=body.preferred_translation,
+        acceptable_variants=body.acceptable_variants,
+        forbidden_variants=body.forbidden_variants,
+        case_sensitive=body.case_sensitive, whole_word=body.whole_word,
+        severity=body.severity, note=body.note)
+    db.add(t)
+    db.commit()
+    db.refresh(t)
+    return _term_rule_out(t)
+
+
+@app.get("/projects/{project_id}/terminology",
+         response_model=list[TerminologyRuleOut])
+def list_term_rules(project_id: int, db: Session = Depends(get_db)):
+    _get_project(db, project_id)
+    return [_term_rule_out(t) for t in
+            db.query(TerminologyRule).filter_by(project_id=project_id)
+            .order_by(TerminologyRule.id).all()]
+
+
+@app.get("/projects/{project_id}/terminology/{rule_id}",
+         response_model=TerminologyRuleOut)
+def get_term_rule(project_id: int, rule_id: int, db: Session = Depends(get_db)):
+    return _term_rule_out(_get_term_rule(db, project_id, rule_id))
+
+
+@app.put("/projects/{project_id}/terminology/{rule_id}",
+         response_model=TerminologyRuleOut)
+def update_term_rule(project_id: int, rule_id: int,
+                     body: TerminologyRuleUpdate, db: Session = Depends(get_db)):
+    t = _get_term_rule(db, project_id, rule_id)
+    merged = TerminologyRuleCreate(
+        source_term=body.source_term or t.source_term,
+        preferred_translation=(body.preferred_translation
+                               or t.preferred_translation),
+        acceptable_variants=(body.acceptable_variants
+                             if body.acceptable_variants is not None
+                             else list(t.acceptable_variants or [])),
+        forbidden_variants=(body.forbidden_variants
+                            if body.forbidden_variants is not None
+                            else list(t.forbidden_variants or [])),
+        case_sensitive=(body.case_sensitive
+                        if body.case_sensitive is not None else t.case_sensitive),
+        whole_word=(body.whole_word if body.whole_word is not None else t.whole_word),
+        severity=body.severity or t.severity,
+        note=body.note if body.note is not None else t.note)
+    if merged.source_term != t.source_term and db.query(TerminologyRule).filter(
+            TerminologyRule.project_id == project_id,
+            TerminologyRule.id != rule_id,
+            TerminologyRule.source_term == merged.source_term).first():
+        raise HTTPException(409, f"源语词条已存在：{merged.source_term}")
+    t.source_term = merged.source_term
+    t.preferred_translation = merged.preferred_translation
+    t.acceptable_variants = merged.acceptable_variants
+    t.forbidden_variants = merged.forbidden_variants
+    t.case_sensitive = merged.case_sensitive
+    t.whole_word = merged.whole_word
+    t.severity = merged.severity
+    t.note = merged.note
+    db.commit()
+    db.refresh(t)
+    return _term_rule_out(t)
+
+
+@app.delete("/projects/{project_id}/terminology/{rule_id}", status_code=204)
+def delete_term_rule(project_id: int, rule_id: int, db: Session = Depends(get_db)):
+    """删除术语条目；已生成报告/新版本保存的是快照，不受影响。"""
+    t = _get_term_rule(db, project_id, rule_id)
+    db.delete(t)
+    db.commit()
+
+
+# ------------------------------------------------ 术语一致性检查
+
+def _load_term_rules(db: Session, project_id: int,
+                     rule_ids: list[int] | None) -> list[TerminologyRuleOut]:
+    q = db.query(TerminologyRule).filter_by(project_id=project_id)
+    if rule_ids is not None:
+        q = q.filter(TerminologyRule.id.in_(rule_ids))
+    rows = q.order_by(TerminologyRule.id).all()
+    if rule_ids is not None:
+        missing = sorted(set(rule_ids) - {r.id for r in rows})
+        if missing:
+            raise HTTPException(404, f"术语条目不存在：{', '.join(map(str, missing))}")
+    return [_term_rule_out(r) for r in rows]
+
+
+def _run_terminology_report(db: Session, p: Project, *, source_id: int,
+                            target_id: int, min_overlap_ms: int,
+                            min_overlap_ratio: float,
+                            rule_ids: list[int] | None
+                            ) -> tuple[TerminologyReport, Version, Version, list[Cue]]:
+    if source_id == target_id:
+        raise HTTPException(400, "源语言版本与译文版本不能相同")
+    sv, tv = (_get_version(db, p.id, source_id),
+              _get_version(db, p.id, target_id))
+    tb = _project_tb(p)
+    opts = AlignOptions.from_ms(min_overlap_ms, min_overlap_ratio,
+                                True, "source_boundaries", tb)
+    rules = _load_term_rules(db, p.id, rule_ids)
+    src_cues, tgt_cues = _cues_of(sv, tb), _cues_of(tv, tb)
+    report, _ = run_terminology(
+        src_cues, tgt_cues, rules, opts, tb,
+        project_id=p.id, source_version_id=sv.id, target_version_id=tv.id,
+        timebase_out=_tb_out(p), min_overlap_ms=min_overlap_ms)
+    return report, sv, tv, tgt_cues
+
+
+@app.post("/projects/{project_id}/terminology/check",
+          response_model=TerminologyReport)
+def terminology_check(project_id: int, body: TerminologyCheckRequest,
+                      db: Session = Depends(get_db)):
+    """复用时间重叠映射逐组核对术语：未译/不一致/禁用变体/大小写错误。
+
+    返回规则快照、两侧 cue、实际命中片段、上下文与字段化原因；可修复
+    问题携带不改时间码/标签/换行的精确替换候选。
+    """
+    p = _get_project(db, project_id)
+    report, _, _, _ = _run_terminology_report(
+        db, p, source_id=body.source_version_id,
+        target_id=body.target_version_id,
+        min_overlap_ms=body.min_overlap_ms,
+        min_overlap_ratio=body.min_overlap_ratio, rule_ids=body.rule_ids)
+    return report
+
+
+@app.post("/projects/{project_id}/terminology/preview",
+          response_model=TerminologyPreviewResponse)
+def terminology_preview(project_id: int, body: TerminologyPreviewRequest,
+                        db: Session = Depends(get_db)):
+    """按候选 id 预览精确替换后的行（不保存、不改动原稿）。"""
+    p = _get_project(db, project_id)
+    report, _, _, tgt_cues = _run_terminology_report(
+        db, p, source_id=body.source_version_id,
+        target_id=body.target_version_id,
+        min_overlap_ms=body.min_overlap_ms,
+        min_overlap_ratio=body.min_overlap_ratio, rule_ids=body.rule_ids)
+    try:
+        items = preview_terminology(report, tgt_cues, body.candidate_ids)
+    except UnknownTermCandidateError as e:
+        raise HTTPException(400, str(e))
+    except TermCandidateStaleError as e:
+        raise HTTPException(409, str(e))
+    return TerminologyPreviewResponse(items=items)
+
+
+@app.post("/projects/{project_id}/terminology/apply",
+          response_model=TerminologyApplyResponse, status_code=201)
+def terminology_apply(project_id: int, body: TerminologyApplyRequest,
+                      db: Session = Depends(get_db)):
+    """把精确替换候选应用到译文版本，保存为带来源与术语规则快照的新版本。
+
+    时间码、标签与换行原样保留；原稿不改动。新版本可继续质检、差异比较
+    及 SRT/WebVTT/帧级导出。
+    """
+    p = _get_project(db, project_id)
+    report, sv, tv, tgt_cues = _run_terminology_report(
+        db, p, source_id=body.source_version_id,
+        target_id=body.target_version_id,
+        min_overlap_ms=body.min_overlap_ms,
+        min_overlap_ratio=body.min_overlap_ratio, rule_ids=body.rule_ids)
+    try:
+        new_cues, applied = apply_terminology(report, tgt_cues, body.candidate_ids)
+    except UnknownTermCandidateError as e:
+        raise HTTPException(400, str(e))
+    except TermCandidateConflictError as e:
+        raise HTTPException(400, str(e))
+    except TermCandidateStaleError as e:
+        raise HTTPException(409, str(e))
+    tb = _project_tb(p)
+    label = body.label or f"{tv.label}-terms"
+    src_fmt = tv.format if tv.format in ("srt", "vtt") else "srt"
+    nv = Version(
+        project_id=project_id, label=label, format=tv.format,
+        content=serialize(new_cues, tb, src_fmt),
+        cues=[c.to_dict() for c in new_cues],
+        origin_version_id=tv.id,
+        provenance={
+            "kind": "terminology",
+            "source_version_id": sv.id,
+            "target_version_id": tv.id,
+            "options": {
+                "min_overlap_ms": body.min_overlap_ms,
+                "min_overlap_ratio": body.min_overlap_ratio,
+                "rule_ids": body.rule_ids,
+            },
+            "applied_candidate_ids": [a["candidate_id"] for a in applied],
+            # 术语规则快照：之后修改/删除条目不影响本版本
+            "rules_snapshot": [r.model_dump(mode="json") for r in report.rules],
+        })
+    db.add(nv)
+    db.commit()
+    db.refresh(nv)
+    return TerminologyApplyResponse(
         new_version_id=nv.id, label=label, origin_version_id=tv.id,
         applied=applied,
         summary={

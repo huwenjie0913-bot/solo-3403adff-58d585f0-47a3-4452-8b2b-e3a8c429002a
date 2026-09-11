@@ -415,3 +415,233 @@ class FrameExport(BaseModel):
     cue_count: int
     shot_cuts: list[int]
     cues: list[FrameCueOut]
+
+
+# ---------------------------------------------------------------- 双语术语表
+
+TermSeverity = Literal["error", "warning"]
+
+
+class TerminologyRuleCreate(BaseModel):
+    """术语表条目：源语词条 + 首选译法 + 可接受/禁用变体。"""
+
+    source_term: str = Field(min_length=1, max_length=200, description="源语词条")
+    preferred_translation: str = Field(
+        min_length=1, max_length=200, description="首选译法（修复候选的替换文本）")
+    acceptable_variants: list[str] = Field(
+        default_factory=list, description="可接受变体（命中不算错，但不计为首选）")
+    forbidden_variants: list[str] = Field(
+        default_factory=list, description="禁用变体（命中报“禁用变体”并建议改为首选译法）")
+    case_sensitive: bool = Field(
+        False, description="大小写敏感：false 时忽略大小写匹配（大小写错误单独报告）")
+    whole_word: bool = Field(
+        True, description="整词匹配：true 时拉丁词只匹配整词边界（CJK 不受影响）")
+    severity: TermSeverity = Field(
+        "error", description="该词条问题的严重级别（error / warning）")
+    note: str | None = Field(None, max_length=500, description="备注")
+
+    @model_validator(mode="after")
+    def _normalize(self) -> "TerminologyRuleCreate":
+        self.source_term = self.source_term.strip()
+        self.preferred_translation = self.preferred_translation.strip()
+        self.acceptable_variants = _clean_variants(self.acceptable_variants)
+        self.forbidden_variants = _clean_variants(self.forbidden_variants)
+        if not self.source_term:
+            raise ValueError("source_term 不能为空")
+        if not self.preferred_translation:
+            raise ValueError("preferred_translation 不能为空")
+        overlap = sorted(set(self.forbidden_variants)
+                         & (set(self.acceptable_variants) | {self.preferred_translation}))
+        if overlap:
+            raise ValueError(f"变体不能同时为禁用与可接受/首选：{', '.join(overlap)}")
+        return self
+
+
+class TerminologyRuleUpdate(BaseModel):
+    """局部更新；变体字段给定时整体替换。"""
+
+    source_term: str | None = Field(None, min_length=1, max_length=200)
+    preferred_translation: str | None = Field(None, min_length=1, max_length=200)
+    acceptable_variants: list[str] | None = None
+    forbidden_variants: list[str] | None = None
+    case_sensitive: bool | None = None
+    whole_word: bool | None = None
+    severity: TermSeverity | None = None
+    note: str | None = Field(None, max_length=500)
+
+    @model_validator(mode="after")
+    def _normalize(self) -> "TerminologyRuleUpdate":
+        if self.source_term is not None:
+            self.source_term = self.source_term.strip()
+            if not self.source_term:
+                raise ValueError("source_term 不能为空")
+        if self.preferred_translation is not None:
+            self.preferred_translation = self.preferred_translation.strip()
+            if not self.preferred_translation:
+                raise ValueError("preferred_translation 不能为空")
+        if self.acceptable_variants is not None:
+            self.acceptable_variants = _clean_variants(self.acceptable_variants)
+        if self.forbidden_variants is not None:
+            self.forbidden_variants = _clean_variants(self.forbidden_variants)
+        return self
+
+
+def _clean_variants(variants: list[str]) -> list[str]:
+    """去空白、去空串、去重保序。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in variants:
+        v = v.strip()
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+class TerminologyRuleOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    project_id: int
+    source_term: str
+    preferred_translation: str
+    acceptable_variants: list[str]
+    forbidden_variants: list[str]
+    case_sensitive: bool
+    whole_word: bool
+    severity: str
+    note: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+# ---------------------------------------------------------------- 双语术语一致性检查
+
+class TerminologyCheckRequest(BaseModel):
+    source_version_id: int = Field(description="源语言字幕版本 id")
+    target_version_id: int = Field(description="译文字幕版本 id")
+    min_overlap_ms: int = Field(
+        200, ge=0, description="时间重叠映射的最小重叠（毫秒），复用双语对齐阈值")
+    min_overlap_ratio: float = Field(
+        0.3, ge=0, le=1, description="重叠比例阈值（低于该值的映射组仍核对术语，但标记重叠不足）")
+    rule_ids: list[int] | None = Field(
+        None, description="只使用指定术语条目；缺省（null）使用项目全部条目")
+
+
+class TermThresholds(BaseModel):
+    min_overlap_ms: int
+    min_overlap_frames: int = Field(description="换算后的帧数（向上取整，至少 1 帧）")
+    min_overlap_ratio: float
+    rule_count: int = Field(description="本次检查实际使用的术语条目数")
+
+
+class TermFragment(BaseModel):
+    """一个实际命中片段及其在原文中的位置（按去标签可见文本计）。"""
+
+    text: str = Field(description="实际片段（命中的源词/译法/变体原文）")
+    cue_index: int = Field(description="所在 cue 序号（该侧版本内）")
+    line_index: int = Field(description="所在行序号（cue 内）")
+    start: int = Field(description="片段在该行去标签可见文本中的起始字符位置")
+    end: int = Field(description="片段结束字符位置（不含）")
+    context: str = Field(description="去标签后的上下文片段（命中处前后各取若干字）")
+
+
+class TermCueRef(BaseModel):
+    """cue 引用：帧号 + 毫秒 + SMPTE 时间码 + 行文本。"""
+
+    index: int
+    start_frame: int
+    end_frame: int
+    start_ms: int
+    end_ms: int
+    start_tc: str
+    end_tc: str
+    lines: list[str]
+
+
+class TermFixCandidate(BaseModel):
+    id: str = Field(description="候选 id（t{组号}.{规则id}.{序号}），预览/应用按 id 选定")
+    action: str = Field(description="replace_term：不改时间码/标签/换行的精确替换")
+    description: str
+    cue_index: int = Field(description="待替换译文 cue 序号")
+    line_index: int
+    start: int = Field(description="替换起点（该行原始文本字符位置）")
+    end: int = Field(description="替换终点（不含）")
+    found: str = Field(description="实际片段（与原文逐字一致才可应用）")
+    replacement: str = Field(description="替换文本（首选译法，与源词大小写形式一致）")
+    preview_line: str = Field(description="替换后该行预览")
+
+
+class TermIssue(BaseModel):
+    issue_type: str = Field(
+        description="term_untranslated / term_inconsistent / "
+                    "term_forbidden_variant / term_case_error")
+    severity: str
+    message: str = Field(description="字段化原因说明")
+    rule: TerminologyRuleOut
+    mapping_id: int | None = Field(
+        None, description="对应的时间重叠映射组号；未匹配源 cue 为 null")
+    source_cues: list[TermCueRef] = Field(description="该组源侧 cue")
+    target_cues: list[TermCueRef] = Field(description="该组译文侧 cue（未匹配源 cue 为空）")
+    source_fragments: list[TermFragment] = Field(
+        default_factory=list, description="源词实际命中片段")
+    target_fragments: list[TermFragment] = Field(
+        default_factory=list, description="译文实际命中片段（禁用变体/错误大小写/不一致译法）")
+    reasons: dict[str, Any] = Field(
+        default_factory=dict, description="字段化原因（期望/实际/标准译法/各组用法…）")
+    fix_candidates: list[TermFixCandidate] = Field(default_factory=list)
+
+
+class TerminologyReport(BaseModel):
+    project_id: int
+    source_version_id: int
+    target_version_id: int
+    generated_at: datetime
+    timebase: TimebaseOut
+    thresholds: TermThresholds
+    rules: list[TerminologyRuleOut] = Field(description="本次检查使用的术语规则快照")
+    summary: dict[str, Any]
+    mapping_count: int = Field(description="时间重叠映射组数（复用双语对齐）")
+    issues: list[TermIssue]
+
+
+class TerminologyPreviewItem(BaseModel):
+    candidate_id: str
+    cue_index: int
+    line_index: int = Field(description="替换所在行（cue 内行号，0 起）")
+    before_line: str = Field(description="替换前行（原文，含标签/换行不变）")
+    after_line: str = Field(description="替换后行预览")
+    found: str
+    replacement: str
+
+
+class TerminologyPreviewRequest(BaseModel):
+    source_version_id: int
+    target_version_id: int
+    candidate_ids: list[str] = Field(description="待预览的候选 id 列表")
+    min_overlap_ms: int = Field(200, ge=0)
+    min_overlap_ratio: float = Field(0.3, ge=0, le=1)
+    rule_ids: list[int] | None = None
+
+
+class TerminologyPreviewResponse(BaseModel):
+    items: list[TerminologyPreviewItem]
+
+
+class TerminologyApplyRequest(BaseModel):
+    source_version_id: int
+    target_version_id: int
+    candidate_ids: list[str] | None = Field(
+        None, description="选定的候选 id；缺省（null）应用全部可修复候选，空列表表示不应用")
+    label: str | None = Field(None, max_length=100, description="新版本标签，缺省自动命名")
+    min_overlap_ms: int = Field(200, ge=0)
+    min_overlap_ratio: float = Field(0.3, ge=0, le=1)
+    rule_ids: list[int] | None = None
+
+
+class TerminologyApplyResponse(BaseModel):
+    new_version_id: int
+    label: str
+    origin_version_id: int = Field(description="新版本的派生来源（译文版本 id）")
+    applied: list[dict[str, Any]] = Field(description="已应用的精确替换")
+    summary: dict[str, Any]

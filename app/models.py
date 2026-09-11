@@ -46,6 +46,37 @@ class Project(Base):
         back_populates="project", cascade="all, delete-orphan",
         order_by="Version.id")
 
+    terminology_rules: Mapped[list["TerminologyRule"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan",
+        order_by="TerminologyRule.id")
+
+
+class TerminologyRule(Base):
+    """双语术语表条目（项目级）：源语词条 + 首选译法/可接受变体/禁用变体。
+
+    应用时保存完整快照到质检结果与新版本 provenance，之后修改/删除条目
+    不影响已生成的报告与新版本。
+    """
+
+    __tablename__ = "terminology_rules"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id"), index=True)
+    source_term: Mapped[str] = mapped_column(String(200))   # 源语词条
+    preferred_translation: Mapped[str] = mapped_column(String(200))  # 首选译法
+    acceptable_variants: Mapped[list] = mapped_column(JSON, default=list)   # 可接受变体
+    forbidden_variants: Mapped[list] = mapped_column(JSON, default=list)    # 禁用变体
+    case_sensitive: Mapped[bool] = mapped_column(Boolean, default=False)  # 大小写敏感
+    whole_word: Mapped[bool] = mapped_column(Boolean, default=True)       # 整词匹配
+    severity: Mapped[str] = mapped_column(String(10), default="error")    # error / warning
+    note: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=_utcnow, onupdate=_utcnow)
+
+    project: Mapped[Project] = relationship(back_populates="terminology_rules")
+
 
 class Version(Base):
     __tablename__ = "versions"
