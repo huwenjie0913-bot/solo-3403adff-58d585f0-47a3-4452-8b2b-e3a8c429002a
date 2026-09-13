@@ -17,6 +17,16 @@
 候选。预览展示改版前后时间码与映射来源（不改原稿），应用后保存带映射快照的
 新版本，可继续质检、版本比较与 SRT/WebVTT/帧级导出。
 
+**字幕样式兼容性校核**模块按目标播放器的渲染配置（目标格式 SRT/WebVTT、
+允许的内联标签与属性、标签嵌套深度、是否允许说话人标签、WebVTT cue settings
+可用字段）逐条 cue 解析原始行与 settings，诊断标签未闭合/多余闭合/交叉、
+样式跨行、未知属性、同片段样式冲突、非法百分比/对齐值、格式不支持项与
+序列化往返漂移（返回 cue、行列位置、可见文本片段与原因）；对可安全处理的
+问题生成**保持时间码、可见文本与换行语义**的修复候选（补齐闭合标签、
+断行处成对拆分、剥离不支持标签/属性、移除不支持设置项等），交叉标签、
+说话人标签、非法枚举值等无法保留原意的问题**只诊断不改写**。预览选定后
+保存带渲染配置快照的新版本。
+
 **全部处理在本地完成，不依赖任何外部模型或服务。**
 
 技术栈：Python 3.11+ · FastAPI · Pydantic v2 · SQLAlchemy 2 · SQLite
@@ -162,6 +172,14 @@ POST   /projects/{id}/terminology/apply           应用选定候选，保存为
 POST   /projects/{id}/conform                     剪辑映射校验 + 逐条 cue 重套计划与候选（不落库）
 POST   /projects/{id}/conform/preview             预览改版前后时间码、映射来源与候选结果（不落库）
 POST   /projects/{id}/conform/apply               应用重套，保存为带剪辑映射快照的新版本
+```
+
+### 字幕样式兼容性校核
+
+```
+POST   /projects/{id}/style-check                 按渲染配置校核标签/属性/settings 与格式兼容性（不落库）
+POST   /projects/{id}/style-check/preview         按候选 id 预览修复后的行/settings（不改原稿）
+POST   /projects/{id}/style-check/apply           应用选定候选，保存为带渲染配置快照的新版本
 ```
 
 ## 剪辑改版字幕重套（re-conform）
@@ -398,6 +416,71 @@ curl -X POST localhost:8000/projects/1/terminology/apply \
     "source_version_id": 1, "target_version_id": 2, "label": "英文-术语统一"}'
 ```
 
+## 字幕样式兼容性校核
+
+为目标播放器建立**渲染配置**（`RenderConfig`），系统逐条 cue 解析原始行与
+WebVTT cue settings，字段缺省时按目标格式自动补默认值：
+
+| 字段 | SRT 默认 | VTT 默认 | 说明 |
+|---|---|---|---|
+| `target_format` | 必填 | 必填 | 目标播放器格式：`srt` / `vtt` |
+| `allowed_tags` | `i,b,u,font` | `i,b,u,c,v,lang,ruby,rt,font` | 允许的内联标签白名单 |
+| `allowed_attributes` | font: color/face/size | 另含 c:class、v:voice、lang:lang | 按标签声明允许的属性 |
+| `max_nesting_depth` | 3 | 3 | 内联标签最大嵌套深度 |
+| `allow_speaker_tags` | false | true | 是否允许说话人标签（`<v …>`） |
+| `allowed_cue_settings` | `[]` | 全部六个 | `vertical/line/position/size/align/region` |
+
+### 诊断项（返回 cue、行列位置、可见文本片段与原因）
+
+| 类型 | 级别 | 说明 | 自动修复 |
+|---|---|---|---|
+| `unclosed_tag` | error | 标签打开后未闭合 | 补齐闭合标签 |
+| `stray_closing_tag` | error | 多余的闭合标签 | 删除 |
+| `crossed_tag` | error | 标签交叉嵌套 | 否（只诊断） |
+| `style_cross_line` | error | 样式标签跨行，播放器可能按行重置 | 断行处成对拆分（行尾闭合、次行行首重开） |
+| `nesting_too_deep` | error | 嵌套深度超过配置 | 剥离超深层的标签对 |
+| `unknown_attribute` | error | 属性不在白名单（如 `<i class>`） | 移除属性、保留标签 |
+| `conflicting_style` | warning | 同名样式重复嵌套、两个 font color 覆盖同片段 | 剥离内层重复标签 |
+| `unsupported_tag` | error | 标签不在白名单（或 SRT 目标遇到 VTT 专有标签） | 剥离标签、保留可见文本 |
+| `speaker_not_allowed` | error | 配置禁止说话人标签时出现 `<v …>` | 否（移除会丢失说话人归属） |
+| `unsupported_override` | error | ASS 覆盖标记（`{\an8}`） | 移除标记 |
+| `unsupported_timestamp_tag` | error | SRT 目标遇到 VTT 卡拉 OK 时间戳标签 | 移除标签 |
+| `unsupported_setting` | error | settings 字段未知或不在允许列表 | 移除该字段 |
+| `invalid_setting_value` | error | 非法百分比（`position:150%`）、非法对齐枚举等 | 否（需人工决定正确值） |
+| `settings_unsupported` | error | SRT 目标不支持任何 cue settings | 移除整段 settings |
+| `identifier_unsupported` | warning | cue 标识符为 WebVTT 专有，转 SRT 会丢失 | 否 |
+| `malformed_tag` | error | 残缺尖括号 | 否 |
+| `roundtrip_drift` | warning | 序列化到目标格式再解析后标识符/可见文本/settings 变化 | 否（差异在 `details.diffs` 给出） |
+
+所有修复候选都标注 `preserves: [timecode, visible_text, line_breaks]`，
+应用时再次校验：可见文本或行数变化即拒绝（400）；触及同一标签或重叠区间的
+候选互斥（400）。候选 id 形如 `s{cue 序号}.c{序号}`，同版本 + 同渲染配置下
+重算稳定。`/style-check/apply` 保存为**关联原版本**的新版本，
+`provenance.render_config` 为渲染配置快照；新版本可继续质检、版本比较与
+SRT/WebVTT/帧级导出。
+
+```bash
+# 1. 按 SRT 播放器渲染配置校核 WebVTT 原稿
+curl -X POST localhost:8000/projects/1/style-check -H 'Content-Type: application/json' -d '{
+  "version_id": 2,
+  "config": {"target_format": "srt"}
+}'
+
+# 2. 预览候选（断行成对拆分、剥离不支持标签等）
+curl -X POST localhost:8000/projects/1/style-check/preview -H 'Content-Type: application/json' -d '{
+  "version_id": 2,
+  "config": {"target_format": "srt"},
+  "candidate_ids": ["s1.c1", "s3.c2"]
+}'
+
+# 3. 应用（缺省应用全部安全候选），保存带渲染配置快照的新版本
+curl -X POST localhost:8000/projects/1/style-check/apply -H 'Content-Type: application/json' -d '{
+  "version_id": 2,
+  "config": {"target_format": "srt"},
+  "label": "v1-srt兼容", "output_format": "auto"
+}'
+```
+
 ## 使用示例
 
 ```bash
@@ -457,6 +540,7 @@ app/
   align.py     双语轨道对齐（重叠分组、同步诊断、源边界拆分/合并/时间调整）
   terminology.py 双语术语一致性（重叠映射逐组核对、禁用/大小写/不一致/未译、精确替换）
   conform.py   剪辑改版字幕重套（映射校验、有理数变速重算、跨切点/删除段诊断与候选）
+  style_qc.py  字幕样式兼容性校核（标签/属性/settings 解析、格式兼容诊断、保义修复候选）
   diffing.py   版本差异比较
   schemas.py   Pydantic 请求/响应模型
   models.py    SQLAlchemy ORM（规则模板/项目/版本/术语条目）
@@ -466,5 +550,6 @@ tests/
   test_align.py    双语对齐与同步检查测试
   test_terminology.py 双语术语一致性测试
   test_conform.py  剪辑改版字幕重套测试
+  test_style_qc.py 字幕样式兼容性校核测试
   test_timecode.py SMPTE 时间码与帧运算测试
 ```

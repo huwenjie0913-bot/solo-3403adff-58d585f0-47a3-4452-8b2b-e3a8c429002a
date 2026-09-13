@@ -65,11 +65,19 @@ from .schemas import (
     ProjectCreate,
     ProjectOut,
     QCReport,
+    RenderConfig,
     RuleTemplateCreate,
     RuleTemplateOut,
     RuleTemplateUpdate,
     Rules,
     StandaloneConvertRequest,
+    StyleApplyRequest,
+    StyleApplyResponse,
+    StyleCheckRequest,
+    StylePreviewItem,
+    StylePreviewRequest,
+    StylePreviewResponse,
+    StyleReport,
     TerminologyApplyRequest,
     TerminologyApplyResponse,
     TerminologyCheckRequest,
@@ -100,6 +108,14 @@ from .terminology import (
     apply_terminology,
     preview_terminology,
     run_terminology,
+)
+from .style_qc import (
+    StyleCandidateConflictError,
+    StyleCandidateUnsafeError,
+    UnknownStyleCandidateError,
+    apply_style_fixes,
+    preview_style_fixes,
+    run_style_check,
 )
 
 
@@ -289,6 +305,9 @@ def root():
             "/projects/{id}/conform",
             "/projects/{id}/conform/preview",
             "/projects/{id}/conform/apply",
+            "/projects/{id}/style-check",
+            "/projects/{id}/style-check/preview",
+            "/projects/{id}/style-check/apply",
             "/projects/{id}/convert", "/timecode/convert",
         ],
     }
@@ -1169,6 +1188,98 @@ def conform_apply(project_id: int, body: ConformApplyRequest,
             "manual_count": manual,
             "direct_retime_count": sum(
                 1 for a in applied if a["action"] == "direct_retime"),
+        })
+
+
+# ---------------------------------------------------------------- 字幕样式兼容性校核
+
+def _run_style_report(db: Session, project_id: int, version_id: int,
+                      config: RenderConfig
+                      ) -> tuple[Project, Version, StyleReport, dict, list[Cue]]:
+    p = _get_project(db, project_id)
+    v = _get_version(db, project_id, version_id)
+    tb = _project_tb(p)
+    cues = _cues_of(v, tb)
+    report, by_cue = run_style_check(
+        cues, config, tb, source_format=v.format,
+        project_id=p.id, version_id=v.id, timebase_out=_tb_out(p))
+    return p, v, report, by_cue, cues
+
+
+@app.post("/projects/{project_id}/style-check", response_model=StyleReport)
+def style_check(project_id: int, body: StyleCheckRequest,
+                db: Session = Depends(get_db)):
+    """按目标播放器渲染配置校核字幕样式兼容性（不落库、不改原稿）。
+
+    逐条 cue 解析原始行与 cue settings，检查标签未闭合/交叉、样式跨行、
+    未知属性、同片段样式冲突、非法百分比/对齐值、格式不支持项，并做
+    序列化往返比对；可安全处理的问题返回保持时间码/可见文本/换行的候选。
+    """
+    _, _, report, _, _ = _run_style_report(
+        db, project_id, body.version_id, body.config)
+    return report
+
+
+@app.post("/projects/{project_id}/style-check/preview",
+          response_model=StylePreviewResponse)
+def style_preview(project_id: int, body: StylePreviewRequest,
+                  db: Session = Depends(get_db)):
+    """按候选 id 预览样式修复后的行与 settings（不保存、不改原稿）。"""
+    _, _, report, by_cue, cues = _run_style_report(
+        db, project_id, body.version_id, body.config)
+    try:
+        items = preview_style_fixes(cues, by_cue, body.candidate_ids)
+    except UnknownStyleCandidateError as e:
+        raise HTTPException(400, str(e))
+    return StylePreviewResponse(items=[StylePreviewItem(**it) for it in items])
+
+
+@app.post("/projects/{project_id}/style-check/apply",
+          response_model=StyleApplyResponse, status_code=201)
+def style_apply(project_id: int, body: StyleApplyRequest,
+                db: Session = Depends(get_db)):
+    """应用样式修复候选，保存为带渲染配置快照的新字幕版本（原稿保留）。
+
+    时间码、可见文本与换行语义保持不变；触及同一标签/区间的候选不能同时
+    应用。无法保留原意的问题（交叉标签、说话人标签、非法枚举值等）只给
+    诊断，不自动改写。
+    """
+    p, v, report, by_cue, cues = _run_style_report(
+        db, project_id, body.version_id, body.config)
+    tb = _project_tb(p)
+    try:
+        new_cues, applied = apply_style_fixes(cues, by_cue, body.candidate_ids)
+    except UnknownStyleCandidateError as e:
+        raise HTTPException(400, str(e))
+    except StyleCandidateConflictError as e:
+        raise HTTPException(400, str(e))
+    except StyleCandidateUnsafeError as e:
+        raise HTTPException(400, str(e))
+    label = body.label or f"{v.label}-styled"
+    out_fmt = (body.config.target_format if body.output_format == "auto"
+               else body.output_format)
+    nv = Version(
+        project_id=project_id, label=label, format=out_fmt,
+        content=serialize(new_cues, tb, out_fmt),
+        cues=[c.to_dict() for c in new_cues],
+        origin_version_id=v.id,
+        provenance={
+            "kind": "style_fix",
+            "origin_version_id": v.id,
+            # 渲染配置快照：之后请求参数变化不影响本版本
+            "render_config": body.config.model_dump(mode="json"),
+            "applied_candidate_ids": [a["candidate_id"] for a in applied],
+        })
+    db.add(nv)
+    db.commit()
+    db.refresh(nv)
+    return StyleApplyResponse(
+        new_version_id=nv.id, label=label, origin_version_id=v.id,
+        output_format=out_fmt, applied=applied,
+        summary={
+            "cue_count_before": len(cues),
+            "cue_count_after": len(new_cues),
+            "applied_count": len(applied),
         })
 
 

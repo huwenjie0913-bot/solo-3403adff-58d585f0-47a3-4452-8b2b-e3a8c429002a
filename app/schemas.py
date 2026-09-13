@@ -893,3 +893,204 @@ class ConformApplyResponse(BaseModel):
     origin_version_id: int = Field(description="新版本的派生来源（原字幕版本 id）")
     applied: list[dict[str, Any]]
     summary: dict[str, Any]
+
+
+# ---------------------------------------------------------------- 字幕样式兼容性校核
+
+StyleTargetFormat = Literal["srt", "vtt"]
+
+# 各目标格式的缺省渲染配置（与常见播放器实现对齐）
+DEFAULT_SRT_TAGS = ["i", "b", "u", "font"]
+DEFAULT_VTT_TAGS = ["i", "b", "u", "c", "v", "lang", "ruby", "rt", "font"]
+DEFAULT_TAG_ATTRIBUTES: dict[str, list[str]] = {
+    "font": ["color", "face", "size"],
+    "c": ["class"],
+    "v": ["voice"],
+    "lang": ["lang"],
+}
+DEFAULT_CUE_SETTINGS = ["vertical", "line", "position", "size", "align", "region"]
+
+
+class RenderConfig(BaseModel):
+    """目标播放器渲染配置：格式、允许的内联标签/属性、嵌套深度、说话人、settings。
+
+    允许标签/属性/cue settings 省略时按目标格式给缺省值（SRT 仅 i/b/u/font，
+    不允许说话人标签与 cue settings；WebVTT 允许完整内部标签集与全部 settings）。
+    """
+
+    target_format: StyleTargetFormat = Field(
+        description="目标播放器字幕格式：srt / vtt")
+    allowed_tags: list[str] | None = Field(
+        None, description="允许的内联标签白名单（小写，如 i、b、u、font、c、v、lang）")
+    allowed_attributes: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="按标签声明允许的属性，如 {\"font\": [\"color\"], \"c\": [\"class\"]}")
+    max_nesting_depth: int = Field(
+        3, ge=0, description="内联标签最大嵌套深度（0 表示不允许任何嵌套）")
+    allow_speaker_tags: bool | None = Field(
+        None, description="是否允许说话人标签（<v …>）；缺省 SRT=false、VTT=true")
+    allowed_cue_settings: list[str] | None = Field(
+        None, description="WebVTT cue settings 可用字段；缺省 SRT=[]、VTT=全部六个")
+
+    @model_validator(mode="after")
+    def _apply_defaults(self) -> "RenderConfig":
+        defaults = (DEFAULT_SRT_TAGS if self.target_format == "srt"
+                    else DEFAULT_VTT_TAGS)
+        if self.allowed_tags is None:
+            self.allowed_tags = list(defaults)
+        else:
+            self.allowed_tags = [t.lower() for t in self.allowed_tags]
+        if self.allow_speaker_tags is None:
+            self.allow_speaker_tags = self.target_format == "vtt"
+        if self.allowed_cue_settings is None:
+            self.allowed_cue_settings = (
+                list(DEFAULT_CUE_SETTINGS) if self.target_format == "vtt" else [])
+        else:
+            self.allowed_cue_settings = [s.lower() for s in self.allowed_cue_settings]
+        self.allowed_attributes = {
+            k.lower(): [a.lower() for a in v]
+            for k, v in (self.allowed_attributes or {}).items()}
+        # 用户未显式声明的标签按各格式常规属性集给缺省
+        for tag, attrs in DEFAULT_TAG_ATTRIBUTES.items():
+            if tag in self.allowed_tags and tag not in self.allowed_attributes:
+                self.allowed_attributes[tag] = list(attrs)
+        return self
+
+    @classmethod
+    def default_srt(cls) -> "RenderConfig":
+        return cls(target_format="srt")
+
+    @classmethod
+    def default_vtt(cls) -> "RenderConfig":
+        return cls(target_format="vtt")
+
+
+class StylePosition(BaseModel):
+    """行列位置：行序号（cue 内 0 起）与行内字符偏移。"""
+
+    line_index: int
+    start: int = Field(description="行内起始字符偏移（含标签的原始文本）")
+    end: int = Field(description="行内结束字符偏移（不含）")
+
+
+class StyleFragment(BaseModel):
+    """问题涉及的可见文本片段（位置按去标签可见文本计）。"""
+
+    line_index: int
+    text: str
+    start: int
+    end: int
+
+
+class StyleFixCandidate(BaseModel):
+    id: str = Field(description="候选 id（s{cue 序号}.c{序号}），预览/应用按 id 选定")
+    action: str = Field(
+        description="repair_structure / unwrap_tag / remove_attribute / "
+                    "remove_override / remove_timestamp_tag / remove_setting / "
+                    "drop_settings")
+    description: str
+    cue_index: int
+    preview_lines: list[str] = Field(description="应用后的行预览（时间码不变）")
+    preview_settings: str | None = None
+    preview_identifier: str | None = None
+    preserves: list[str] = Field(
+        description="应用后保持不变的语义：timecode / visible_text / line_breaks")
+
+
+class StyleIssue(BaseModel):
+    cue_index: int
+    issue_type: str = Field(
+        description="unclosed_tag / stray_closing_tag / crossed_tag / style_cross_line / "
+                    "nesting_too_deep / unknown_attribute / conflicting_style / "
+                    "unsupported_tag / speaker_not_allowed / unsupported_override / "
+                    "unsupported_timestamp_tag / unsupported_setting / "
+                    "invalid_setting_value / settings_unsupported / "
+                    "identifier_unsupported / malformed_tag / roundtrip_drift")
+    severity: Literal["error", "warning"]
+    message: str = Field(description="问题原因")
+    positions: list[StylePosition] = Field(
+        default_factory=list, description="行列位置（标签/属性在原始行中的偏移）")
+    fragments: list[StyleFragment] = Field(
+        default_factory=list, description="涉及的可见文本片段")
+    details: dict[str, Any] = Field(default_factory=dict)
+    fix_candidates: list[StyleFixCandidate] = Field(default_factory=list)
+
+
+class StyleCueRef(BaseModel):
+    index: int
+    start_frame: int
+    end_frame: int
+    start_ms: int
+    end_ms: int
+    start_tc: str
+    end_tc: str
+    lines: list[str] = Field(description="原始行（含标签）")
+    visible_lines: list[str] = Field(description="去标签后的可见文本行")
+    identifier: str | None = None
+    settings: str | None = None
+
+
+class StyleCueResult(BaseModel):
+    cue: StyleCueRef
+    issues: list[StyleIssue]
+
+
+class StyleCheckRequest(BaseModel):
+    version_id: int
+    config: RenderConfig
+
+
+class StyleReport(BaseModel):
+    project_id: int
+    version_id: int
+    generated_at: datetime
+    source_format: str = Field(description="版本原始格式（srt / vtt / json）")
+    target_format: str = Field(description="渲染配置声明的目标格式")
+    timebase: TimebaseOut
+    config: RenderConfig = Field(description="本次校核使用的渲染配置快照")
+    summary: dict[str, Any]
+    cues: list[StyleCueResult] = Field(description="逐条 cue 的诊断与修复候选")
+
+
+class _StyleSelectionBase(BaseModel):
+    version_id: int
+    config: RenderConfig
+
+
+class StylePreviewRequest(_StyleSelectionBase):
+    candidate_ids: list[str] = Field(description="待预览的候选 id 列表")
+
+
+class StylePreviewItem(BaseModel):
+    candidate_id: str
+    cue_index: int
+    action: str
+    description: str
+    before_lines: list[str]
+    before_settings: str | None = None
+    before_identifier: str | None = None
+    after_lines: list[str]
+    after_settings: str | None = None
+    after_identifier: str | None = None
+    preserves: list[str]
+
+
+class StylePreviewResponse(BaseModel):
+    items: list[StylePreviewItem]
+
+
+class StyleApplyRequest(_StyleSelectionBase):
+    candidate_ids: list[str] | None = Field(
+        None, description="选定的候选 id；缺省（null）应用全部可修复候选，空列表表示不应用")
+    label: str | None = Field(None, max_length=100, description="新版本标签，缺省自动命名")
+    output_format: Literal["auto", "srt", "vtt"] = Field(
+        "auto", description="新版本序列格式；auto 取渲染配置目标格式")
+
+
+class StyleApplyResponse(BaseModel):
+    new_version_id: int
+    label: str
+    origin_version_id: int = Field(description="新版本的派生来源（被校核版本 id）")
+    output_format: str
+    applied: list[dict[str, Any]]
+    summary: dict[str, Any]
